@@ -1,5 +1,7 @@
-
 physicsMDSR_Range_CSV/
 PhysicsMDRS
 *.zip
 *.docx
+*/.DS_Store
+.DS_Store
+

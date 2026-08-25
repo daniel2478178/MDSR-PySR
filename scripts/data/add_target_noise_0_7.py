@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Create deterministic target-scaled CSV datasets for several noise levels.
+"""Create reproducible multiplicative-Gaussian-noise target datasets.
 
 For every ID in the metadata workbook, the program processes only the files
 DATA_FOLDER/ID/0.csv through DATA_FOLDER/ID/7.csv.  Other filenames and CSVs
-inside nested directories are ignored.  For each requested noise value n, it
-writes a corresponding copy below NOISE_FOLDER/<noise-value>/ID and applies:
+inside nested directories are ignored. For each requested noise standard
+deviation n, it writes a copy below NOISE_FOLDER/<noise-value>/ID and applies:
 
-    target_value = target_value * (1 + n)
+    epsilon ~ Normal(0, n**2)
+    noisy_target = target_value * (1 + epsilon)
+
+A separate epsilon is sampled for every row. Random streams are derived from
+the base seed, noise level, ID, and dataset filename, so reruns are identical.
 
 The target column name is read from the workbook's ``Target`` column.  Thus an
 ID whose Target value is ``v`` modifies the CSV column named ``v``.
@@ -22,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import random
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -37,6 +43,7 @@ except ImportError as exc:  # pragma: no cover - depends on the user's machine
 
 
 DEFAULT_NOISES = "n1=0.01,n2=0.03,n3=0.05,n4=0.1"
+DEFAULT_SEED = 20260825
 ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
 DATASET_INDICES = tuple(range(8))
 
@@ -180,7 +187,13 @@ def inspect_csv(path: Path, relative_path: Path, target: str) -> CsvInfo:
     return CsvInfo(path, relative_path, encoding, dialect, actual_target)
 
 
-def scaled_number(text: str, multiplier: Decimal, path: Path, row_number: int) -> str:
+def noisy_number(
+    text: str,
+    noise: Decimal,
+    rng: random.Random,
+    path: Path,
+    row_number: int,
+) -> str:
     stripped = text.strip()
     if stripped == "":
         return text
@@ -192,15 +205,31 @@ def scaled_number(text: str, multiplier: Decimal, path: Path, row_number: int) -
         ) from exc
     if not value.is_finite():
         raise ValueError(f"Non-finite target value {text!r} in {path}, CSV row {row_number}.")
-    result = value * multiplier
+    epsilon = Decimal(str(rng.gauss(0.0, float(noise))))
+    result = value * (Decimal(1) + epsilon)
     if result == 0:
         return "0"
     return str(result.normalize())
 
 
-def write_scaled_csv(info: CsvInfo, destination: Path, noise: Decimal) -> None:
+def noise_rng(
+    base_seed: int,
+    noise: Decimal,
+    item_id: str,
+    relative_path: Path,
+) -> random.Random:
+    key = f"{base_seed}|{noise.normalize()}|{item_id}|{relative_path.as_posix()}"
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:16], "big"))
+
+
+def write_noisy_csv(
+    info: CsvInfo,
+    destination: Path,
+    noise: Decimal,
+    rng: random.Random,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    multiplier = Decimal(1) + noise
 
     with info.source.open("r", encoding=info.encoding, newline="") as source_handle:
         reader = csv.DictReader(source_handle, dialect=info.dialect)
@@ -215,8 +244,8 @@ def write_scaled_csv(info: CsvInfo, destination: Path, noise: Decimal) -> None:
             )
             writer.writeheader()
             for row_number, row in enumerate(reader, start=2):
-                row[info.target_column] = scaled_number(
-                    row[info.target_column], multiplier, info.source, row_number
+                row[info.target_column] = noisy_number(
+                    row[info.target_column], noise, rng, info.source, row_number
                 )
                 writer.writerow(row)
 
@@ -249,7 +278,7 @@ def collect_csv_files(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Scale each ID's CSV target column for several noise levels."
+        description="Add reproducible multiplicative Gaussian noise to CSV targets."
     )
     parser.add_argument("metadata_file", type=Path, help="Excel file containing ID and Target columns")
     parser.add_argument("data_folder", type=Path, help="Input root containing one folder per ID")
@@ -257,7 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--noises",
         default=DEFAULT_NOISES,
-        help=f"Comma-separated values or labels (default: {DEFAULT_NOISES})",
+        help=(
+            "Comma-separated relative standard deviations or labels "
+            f"(default: {DEFAULT_NOISES})"
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"Base random seed (default: {DEFAULT_SEED})",
     )
     parser.add_argument(
         "--sheet",
@@ -298,7 +336,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             for info in csv_files:
                 item_id = info.source.relative_to(args.data_folder).parts[0]
                 destination = level_folder / item_id / info.relative_to_id
-                write_scaled_csv(info, destination, noise)
+                rng = noise_rng(args.seed, noise, item_id, info.relative_to_id)
+                write_noisy_csv(info, destination, noise, rng)
                 written += 1
 
         print(

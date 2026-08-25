@@ -31,7 +31,7 @@ fit each candidate independently across groups 0–7
 remove equivalent formulas and rank by shared-fit error
         │
         ├── WASS distribution-shift evaluation
-        ├── deterministic target-scaling evaluation
+        ├── multiplicative target-noise evaluation
         └── structural-similarity plots
 ```
 
@@ -244,17 +244,17 @@ python scripts/data/generate_mdsr_testsets.py \
 
 #### `scripts/data/add_target_noise_0_7.py`
 
-Creates deterministic target-scaled copies of datasets `0–7`.
-
-Despite the historical “noise” name, it does not add random noise. For level
-`n`, it applies:
+Creates reproducible multiplicative-Gaussian-noise copies of datasets `0–7`.
+For every target row and noise level `n`, it independently samples and applies:
 
 ```text
-scaled_target = target × (1 + n)
+epsilon ~ Normal(0, n²)
+noisy_target = target × (1 + epsilon)
 ```
 
 The default levels are `0.01`, `0.03`, `0.05`, and `0.1`, stored in directories
-`001`, `003`, `005`, and `01`.
+`001`, `003`, `005`, and `01`. Random streams are deterministically derived
+from `--seed`, noise level, problem ID, and dataset filename.
 
 ```bash
 python scripts/data/add_target_noise_0_7.py \
@@ -350,7 +350,7 @@ python scripts/evaluation/fit_wass_metrics.py \
 #### `scripts/evaluation/fit_noise_metrics.py`
 
 Uses the same bounded least-squares fitting implementation as the WASS evaluator
-but reads the value-named target-scaling directories produced by
+but reads the value-named noisy-target directories produced by
 `add_target_noise_0_7.py`.
 
 ```bash
