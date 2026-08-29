@@ -1,30 +1,32 @@
 # -*- coding: utf-8 -*-
 import argparse
+import contextlib
+import json
+import multiprocessing as mp
+import os
+import re
+import time
+import warnings
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
-import json, re, warnings, os, multiprocessing as mp, time, contextlib
-from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 import numpy as np
 import pandas as pd
 import sympy as sp
 
-ROOT = Path(__file__).resolve().parents[2]
-EXCEL_FILE = ROOT / "physicsMDSR_Range.xlsx"
-DATA_ROOT = ROOT / "physicsMDSR_Range_CSV"
-SHEET_NAME = "Sampling design"
-# Only fit the first eight experimental conditions: 0.csv ... 7.csv.
-DATASET_INDICES = range(8)
-
-niterations = 1
+DEFAULT_SHEET_NAME = "Sampling design"
+DEFAULT_DATASET_INDICES = tuple(range(8))
+DEFAULT_ITERATIONS = 400
 populations = 20
 population_size = 40
 nodemaxsize = 50
 min_complexity = 7
-max_complexity =40
-top_n = 10
+max_complexity = 40
+DEFAULT_TOP_N = 10
+DEFAULT_OUTER_PROCESSES = 4
+DEFAULT_PYSR_PROCESSES = 3
 
-OUTER_PROCESSES = 4
-PYSR_PROCS_PER_PROCESS = 6
 
 binary_operators = ["+", "-", "*", "/", "^"]
 unary_operators = ["cos", "sin", "exp", "sqrt", "log", "tanh", "acos", "atan", "atanh"]
@@ -40,11 +42,25 @@ nested_constraints = {
     "atanh": {"sin": 0, "cos": 0, "acos": 0, "atanh": 0, "tanh": 0},
 }
 
-REQUIRE_ALL_FILES = True
-SAVE_ALL_EQUATIONS = True
-SUMMARY_NAME = "pysr_warm_0_7_summary.csv"
-RUN_ID = "warm_0_7_with_params"
-TARGET_ROW_IDS = None
+DEFAULT_SUMMARY_NAME = "pysr_warm_0_7_summary.csv"
+DEFAULT_RUN_ID = "warm_0_7_with_params"
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    workbook: Path
+    data_root: Path
+    sheet_name: str
+    dataset_indices: tuple[int, ...]
+    target_row_ids: tuple[str, ...] | None
+    iterations: int
+    outer_processes: int
+    pysr_processes: int
+    top_n: int
+    run_id: str
+    summary_name: str
+    require_all_files: bool
+    save_all_equations: bool
 
 
 def parse_dataset_indices(value):
@@ -65,40 +81,38 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Run PySR discovery with physical parameters and constants as features")
     parser.add_argument("workbook", type=Path, help="Benchmark metadata workbook")
     parser.add_argument("data_root", type=Path, help="Root containing one dataset directory per ID")
-    parser.add_argument("--sheet", default=SHEET_NAME)
-    parser.add_argument("--datasets", type=parse_dataset_indices, default=tuple(DATASET_INDICES))
+    parser.add_argument("--sheet", default=DEFAULT_SHEET_NAME)
+    parser.add_argument("--datasets", type=parse_dataset_indices, default=DEFAULT_DATASET_INDICES)
     parser.add_argument("--ids", nargs="+", help="Optional subset of benchmark IDs")
-    parser.add_argument("--iterations", type=int, default=niterations)
-    parser.add_argument("--outer-processes", type=int, default=OUTER_PROCESSES)
-    parser.add_argument("--pysr-processes", type=int, default=PYSR_PROCS_PER_PROCESS)
-    parser.add_argument("--top-n", type=int, default=top_n)
-    parser.add_argument("--run-id", default=RUN_ID)
-    parser.add_argument("--summary-name", default=SUMMARY_NAME)
+    parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
+    parser.add_argument("--outer-processes", type=int, default=DEFAULT_OUTER_PROCESSES)
+    parser.add_argument("--pysr-processes", type=int, default=DEFAULT_PYSR_PROCESSES)
+    parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
+    parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
+    parser.add_argument("--summary-name", default=DEFAULT_SUMMARY_NAME)
     parser.add_argument("--allow-missing-files", action="store_true")
     parser.add_argument("--no-save-all-equations", action="store_true")
     return parser
 
 
-def configure(args):
-    global ROOT, EXCEL_FILE, DATA_ROOT, SHEET_NAME, DATASET_INDICES
-    global TARGET_ROW_IDS, niterations, OUTER_PROCESSES, PYSR_PROCS_PER_PROCESS
-    global top_n, RUN_ID, SUMMARY_NAME, REQUIRE_ALL_FILES, SAVE_ALL_EQUATIONS
+def build_config(args):
     if min(args.iterations, args.outer_processes, args.pysr_processes, args.top_n) <= 0:
         raise ValueError("iterations, process counts, and top-n must be positive")
-    EXCEL_FILE = args.workbook.expanduser().resolve()
-    DATA_ROOT = args.data_root.expanduser().resolve()
-    ROOT = EXCEL_FILE.parent
-    SHEET_NAME = args.sheet
-    DATASET_INDICES = tuple(args.datasets)
-    TARGET_ROW_IDS = tuple(args.ids) if args.ids else None
-    niterations = args.iterations
-    OUTER_PROCESSES = args.outer_processes
-    PYSR_PROCS_PER_PROCESS = args.pysr_processes
-    top_n = args.top_n
-    RUN_ID = args.run_id
-    SUMMARY_NAME = args.summary_name
-    REQUIRE_ALL_FILES = not args.allow_missing_files
-    SAVE_ALL_EQUATIONS = not args.no_save_all_equations
+    return RunConfig(
+        workbook=args.workbook.expanduser().resolve(),
+        data_root=args.data_root.expanduser().resolve(),
+        sheet_name=args.sheet,
+        dataset_indices=tuple(args.datasets),
+        target_row_ids=tuple(args.ids) if args.ids else None,
+        iterations=args.iterations,
+        outer_processes=args.outer_processes,
+        pysr_processes=args.pysr_processes,
+        top_n=args.top_n,
+        run_id=args.run_id,
+        summary_name=args.summary_name,
+        require_all_files=not args.allow_missing_files,
+        save_all_equations=not args.no_save_all_equations,
+    )
 
 def _alpha_index(i):
     letters = "abcdefghijklmnopqrstuvwxyz"
@@ -144,21 +158,26 @@ NUMBER_PREFIX_RE = re.compile(
 )
 
 def parse_independent_vars(value):
-    if pd.isna(value): return []
+    if pd.isna(value):
+        return []
     return [x.strip() for x in re.split(r"[,;]", str(value)) if x.strip()]
 
 def parse_parameter_names(value):
-    if pd.isna(value): return []
+    if pd.isna(value):
+        return []
     return [name for name, _, _ in RANGE_RE.findall(str(value))]
 
 def parse_fixed_constants(value):
-    if pd.isna(value): return {}
+    if pd.isna(value):
+        return {}
     text = str(value).strip()
-    if not text or text.lower() in {"(none)", "none", "nan"}: return {}
+    if not text or text.lower() in {"(none)", "none", "nan"}:
+        return {}
     out = {}
     for part in text.split(";"):
         part = part.strip()
-        if not part or "=" not in part: continue
+        if not part or "=" not in part:
+            continue
         name, val = part.split("=", 1)
         match = NUMBER_PREFIX_RE.fullmatch(val.strip())
         if match is None:
@@ -166,18 +185,20 @@ def parse_fixed_constants(value):
         out[name.strip()] = float(match.group(1))
     return out
 
-def parse_para_value(value):
+def parse_para_value(value, dataset_indices):
     if pd.isna(value):
         raise ValueError("paraValue 为空")
     data = json.loads(str(value))
-    if len(data) < len(DATASET_INDICES):
+    required_length = max(dataset_indices) + 1
+    if len(data) < required_length:
         raise ValueError(
-            f"paraValue 只有 {len(data)} 组，至少需要 {len(DATASET_INDICES)} 组"
+            f"paraValue 只有 {len(data)} 组，数据集索引 "
+            f"{max(dataset_indices)} 至少需要 {required_length} 组"
         )
     return data
 
-def load_metadata():
-    df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME)
+def load_metadata(config):
+    df = pd.read_excel(config.workbook, sheet_name=config.sheet_name)
     required = {"ID", "IndependentVars", "ParameterRange", "FixedConstantValues", "paraValue"}
     missing = required - set(df.columns)
     if missing:
@@ -189,7 +210,7 @@ def load_metadata():
         independent_vars = parse_independent_vars(row["IndependentVars"])
         parameter_names = parse_parameter_names(row["ParameterRange"])
         fixed_constants = parse_fixed_constants(row["FixedConstantValues"])
-        para_values = parse_para_value(row["paraValue"])
+        para_values = parse_para_value(row["paraValue"], config.dataset_indices)
 
         for i, vec in enumerate(para_values):
             if len(vec) != len(parameter_names):
@@ -247,14 +268,14 @@ def read_data(csv_file, independent_vars, parameter_names, parameter_values,
         raise ValueError(f"{csv_file}: 没有有效数据")
     return X, y, target_name
 
-def build_model(id_folder):
+def build_model(id_folder, config):
     from pysr import PySRRegressor
 
     run_root = id_folder / "pysr_runs"
     run_root.mkdir(parents=True, exist_ok=True)
 
     return PySRRegressor(
-        niterations=niterations,
+        niterations=config.iterations,
         populations=populations,
         population_size=population_size,
         binary_operators=binary_operators,
@@ -270,13 +291,13 @@ def build_model(id_folder):
         should_optimize_constants=True,
         batching=False,
         warm_start=True,
-        procs=PYSR_PROCS_PER_PROCESS,
+        procs=config.pysr_processes,
         verbosity=0,
         output_directory=str(run_root),
-        run_id=RUN_ID,
+        run_id=config.run_id,
     )
 
-def select_top_pysr_models(equations_df):
+def select_top_pysr_models(equations_df, top_n):
     filtered = equations_df[
         (equations_df["complexity"] >= min_complexity)
         & (equations_df["complexity"] <= max_complexity)
@@ -307,13 +328,13 @@ def replace_floats_toConstant(expr):
 
 def save_regression_result(model, id_folder, dataset_index, csv_file, target_name,
                            independent_vars, parameter_names, parameter_values,
-                           fixed_constants, safe_to_original):
+                           fixed_constants, safe_to_original, config):
     equations = model.equations_.copy()
 
-    if SAVE_ALL_EQUATIONS:
+    if config.save_all_equations:
         equations.to_csv(id_folder / f"{dataset_index}_pysr_all.csv", index=False)
 
-    top = select_top_pysr_models(equations)
+    top = select_top_pysr_models(equations, config.top_n)
     out_rows = []
 
     for _, row in top.iterrows():
@@ -347,7 +368,7 @@ def save_regression_result(model, id_folder, dataset_index, csv_file, target_nam
         })
 
     top_df = pd.DataFrame(out_rows)
-    top_df.to_csv(id_folder / f"{dataset_index}_pysr_top{top_n}.csv", index=False)
+    top_df.to_csv(id_folder / f"{dataset_index}_pysr_top{config.top_n}.csv", index=False)
     return top_df
 
 
@@ -361,18 +382,23 @@ def quiet_model_fit(model, X, y):
             return model.fit(X, y)
 
 
-def process_one_id(row_id, info, worker_id=None, progress_queue=None, worker_state=None):
-    id_folder = DATA_ROOT / row_id
+def resolve_id_folder(row_id, config):
+    return config.data_root / row_id
+
+
+def process_one_id(row_id, info, config, worker_id=None, progress_queue=None,
+                   worker_state=None):
+    id_folder = resolve_id_folder(row_id, config)
 
     if not id_folder.is_dir():
         msg = f"找不到目录: {id_folder}"
-        if REQUIRE_ALL_FILES:
+        if config.require_all_files:
             raise FileNotFoundError(msg)
         return
 
-    summary_file = id_folder / SUMMARY_NAME
+    summary_file = id_folder / config.summary_name
     if summary_file.is_file() and summary_file.stat().st_size > 0:
-        skipped_units = len(DATASET_INDICES)
+        skipped_units = len(config.dataset_indices)
         if worker_state is not None:
             worker_state["completed_units"] += skipped_units
         return "SKIPPED"
@@ -389,15 +415,15 @@ def process_one_id(row_id, info, worker_id=None, progress_queue=None, worker_sta
     )
 
     # One model per folder; warm_start is shared only inside this folder.
-    model = build_model(id_folder)
+    model = build_model(id_folder, config)
     summary_parts = []
 
-    for dataset_index in DATASET_INDICES:
+    for dataset_index in config.dataset_indices:
         csv_file = id_folder / f"{dataset_index}.csv"
 
         if not csv_file.exists():
             msg = f"{row_id}: 缺少 {csv_file.name}"
-            if REQUIRE_ALL_FILES:
+            if config.require_all_files:
                 raise FileNotFoundError(msg)
             continue
 
@@ -471,6 +497,7 @@ def process_one_id(row_id, info, worker_id=None, progress_queue=None, worker_sta
             parameter_values=parameter_values,
             fixed_constants=fixed_constants,
             safe_to_original=safe_to_original,
+            config=config,
         )
 
         summary_parts.append(top_df)
@@ -478,7 +505,7 @@ def process_one_id(row_id, info, worker_id=None, progress_queue=None, worker_sta
     if summary_parts:
         summary = pd.concat(summary_parts, ignore_index=True)
         summary.to_csv(
-            id_folder / SUMMARY_NAME,
+            id_folder / config.summary_name,
             index=False,
         )
 
@@ -503,7 +530,7 @@ def format_clock_time(timestamp):
     )
 
 
-def process_directory_task(row_id, info, progress_queue):
+def process_directory_task(row_id, info, config, progress_queue):
     """Process one ID directory as one queue task.
 
     ProcessPoolExecutor keeps four worker processes alive.  Whenever a worker
@@ -515,7 +542,7 @@ def process_directory_task(row_id, info, progress_queue):
     worker_state = {
         "worker_start": worker_start,
         "completed_units": 0,
-        "total_units": len(DATASET_INDICES),
+        "total_units": len(config.dataset_indices),
         "observed_unit_times": [],
     }
     progress_queue.put({
@@ -527,6 +554,7 @@ def process_directory_task(row_id, info, progress_queue):
         process_status = process_one_id(
             row_id,
             info,
+            config,
             worker_id=worker_id,
             progress_queue=progress_queue,
             worker_state=worker_state,
@@ -559,18 +587,18 @@ def process_directory_task(row_id, info, progress_queue):
         "error": error_text,
     }
 
-def is_directory_complete(row_id):
+def is_directory_complete(row_id, config):
     """Use the existing non-empty summary as the directory completion marker."""
-    summary_file = DATA_ROOT / row_id / SUMMARY_NAME
+    summary_file = resolve_id_folder(row_id, config) / config.summary_name
     return summary_file.is_file() and summary_file.stat().st_size > 0
 
 
-def collect_unfinished_tasks(metadata):
+def collect_unfinished_tasks(metadata, config):
     """Return one queue item per ID whose summary has not been completed."""
     unfinished = []
     completed_ids = []
     for row_id, info in metadata.items():
-        if is_directory_complete(row_id):
+        if is_directory_complete(row_id, config):
             completed_ids.append(row_id)
         else:
             unfinished.append((row_id, info))
@@ -578,21 +606,29 @@ def collect_unfinished_tasks(metadata):
 
 def main(argv=None):
     """Run unfinished ID directories through one shared four-process queue."""
-    configure(build_parser().parse_args(argv))
-    if not EXCEL_FILE.exists():
-        raise FileNotFoundError(EXCEL_FILE)
-    if not DATA_ROOT.is_dir():
-        raise FileNotFoundError(DATA_ROOT)
+    config = build_config(build_parser().parse_args(argv))
+    if not config.workbook.exists():
+        raise FileNotFoundError(config.workbook)
+    if not config.data_root.is_dir():
+        raise FileNotFoundError(config.data_root)
 
-    metadata = load_metadata()
-    if TARGET_ROW_IDS is not None:
-        missing = [row_id for row_id in TARGET_ROW_IDS if row_id not in metadata]
+    print(
+        f"配置 | workbook={config.workbook} | data_root={config.data_root} "
+        f"| datasets={config.dataset_indices} | iterations={config.iterations} "
+        f"| outer_processes={config.outer_processes} "
+        f"| pysr_processes={config.pysr_processes} | run_id={config.run_id}",
+        flush=True,
+    )
+
+    metadata = load_metadata(config)
+    if config.target_row_ids is not None:
+        missing = [row_id for row_id in config.target_row_ids if row_id not in metadata]
         if missing:
             raise KeyError(f"Excel 中缺少目标 ID: {missing}")
-        metadata = {row_id: metadata[row_id] for row_id in TARGET_ROW_IDS}
-    tasks, already_completed = collect_unfinished_tasks(metadata)
+        metadata = {row_id: metadata[row_id] for row_id in config.target_row_ids}
+    tasks, already_completed = collect_unfinished_tasks(metadata, config)
     total_dirs = len(tasks)
-    active_process_count = min(OUTER_PROCESSES, total_dirs)
+    active_process_count = min(config.outer_processes, total_dirs)
 
     print(
         f"全部目录={len(metadata)} | 已完成并跳过={len(already_completed)} "
@@ -605,7 +641,7 @@ def main(argv=None):
 
     ctx = mp.get_context("spawn")
     overall_start = time.perf_counter()
-    total_units = total_dirs * len(DATASET_INDICES)
+    total_units = total_dirs * len(config.dataset_indices)
     completed_units = 0
     completed_dirs = 0
     failed_dirs = 0
@@ -627,7 +663,7 @@ def main(argv=None):
 
         if msg_type == "csv_done":
             current = task_reported_units.get(row_id, 0)
-            if current < len(DATASET_INDICES):
+            if current < len(config.dataset_indices):
                 task_reported_units[row_id] = current + 1
                 completed_units += 1
             active_tasks[worker_id] = (row_id, msg.get("dataset_index"))
@@ -653,9 +689,9 @@ def main(argv=None):
                 reported = task_reported_units.get(row_id, 0)
                 completed_units += max(
                     0,
-                    len(DATASET_INDICES) - reported,
+                    len(config.dataset_indices) - reported,
                 )
-                task_reported_units[row_id] = len(DATASET_INDICES)
+                task_reported_units[row_id] = len(config.dataset_indices)
 
             if active_tasks.get(worker_id, (None, None))[0] == row_id:
                 active_tasks.pop(worker_id, None)
@@ -714,7 +750,7 @@ def main(argv=None):
     with mp.Manager() as manager:
         progress_queue = manager.Queue()
         with ProcessPoolExecutor(
-            max_workers=OUTER_PROCESSES,
+            max_workers=config.outer_processes,
             mp_context=ctx,
         ) as executor:
             # One future equals one ID subdirectory. ProcessPoolExecutor keeps
@@ -725,6 +761,7 @@ def main(argv=None):
                     process_directory_task,
                     row_id,
                     info,
+                    config,
                     progress_queue,
                 ): row_id
                 for row_id, info in tasks
@@ -793,6 +830,9 @@ def main(argv=None):
                 f"[{result['row_id']}] {result['error']}",
                 flush=True,
             )
+
+    if total_failed:
+        raise RuntimeError(f"{total_failed} 个目录处理失败")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+{
+  "run_id": "warm_0_7_xonly_v2",
+  "dataset": 3,
+  "source_csv": "/Users/daniel/equation_verfication/problem/P06/3.csv",
+  "top_csv": "/Users/daniel/equation_verfication/problem/P06/3_pysr_top10.csv",
+  "all_csv": "/Users/daniel/equation_verfication/problem/P06/3_pysr_all.csv",
+  "completed_at": "2026-08-28 10:41:26"
+}

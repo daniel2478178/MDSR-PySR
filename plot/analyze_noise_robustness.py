@@ -1,0 +1,397 @@
+from pathlib import Path
+import os
+import tempfile
+
+import numpy as np
+import pandas as pd
+
+
+BASE_DIR = Path(__file__).resolve().parent
+OUT_DIR = BASE_DIR / "noise_robustness_figures"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PLOT_CACHE = Path(tempfile.gettempdir()) / "mdsr_plot_cache"
+PLOT_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(PLOT_CACHE / "matplotlib"),
+)
+os.environ.setdefault("XDG_CACHE_HOME", str(PLOT_CACHE))
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+TRAINING_FILES = {
+    0.00: BASE_DIR / "不带参数.xlsx",
+    0.01: BASE_DIR / "噪声001统计表(1).xlsx",
+    0.03: BASE_DIR / "噪声003统计表.xlsx",
+}
+TEST_COLUMNS = {
+    0.00: "noise_0_R2",
+    0.01: "noise_001_R2",
+    0.03: "noise_003_R2",
+    0.05: "noise_005_R2",
+    0.10: "noise_01_R2",
+}
+LABELS = {
+    0.00: "Train noise 0",
+    0.01: "Train noise 0.01",
+    0.03: "Train noise 0.03",
+}
+COLORS = {
+    0.00: "#1F4E79",
+    0.01: "#E69F00",
+    0.03: "#C44E52",
+}
+FAILURE_SENTINEL = -1e50
+
+
+plt.rcParams.update(
+    {
+        "font.size": 10,
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+        "axes.titleweight": "bold",
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "figure.dpi": 130,
+        "savefig.dpi": 300,
+    }
+)
+
+
+def load_workbook(path):
+    frame = pd.read_excel(path, sheet_name=0, engine="openpyxl")
+    frame = frame[frame["ID"].astype(str).str.fullmatch(r"P\d+")].copy()
+    frame = frame.set_index("ID", verify_integrity=True)
+
+    for column in TEST_COLUMNS.values():
+        values = pd.to_numeric(frame[column], errors="coerce")
+        frame[column] = values.mask(values <= FAILURE_SENTINEL)
+
+    return frame
+
+
+def wilson_interval(successes, total, z=1.96):
+    proportion = successes / total
+    denominator = 1 + z**2 / total
+    center = (proportion + z**2 / (2 * total)) / denominator
+    margin = (
+        z
+        * np.sqrt(
+            proportion * (1 - proportion) / total
+            + z**2 / (4 * total**2)
+        )
+        / denominator
+    )
+    return center - margin, center + margin
+
+
+def save_figure(fig, filename):
+    fig.savefig(OUT_DIR / filename, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+data = {noise: load_workbook(path) for noise, path in TRAINING_FILES.items()}
+common_ids = sorted(
+    set.intersection(*(set(frame.index) for frame in data.values())),
+    key=lambda value: int(value[1:]),
+)
+
+records = []
+for train_noise, frame in data.items():
+    for test_noise, column in TEST_COLUMNS.items():
+        values = frame.loc[common_ids, column]
+        for equation_id, r2 in values.items():
+            records.append(
+                {
+                    "ID": equation_id,
+                    "train_noise": train_noise,
+                    "test_noise": test_noise,
+                    "r2": r2,
+                }
+            )
+
+long = pd.DataFrame(records)
+summary_rows = []
+for (train_noise, test_noise), group in long.groupby(
+    ["train_noise", "test_noise"], sort=True
+):
+    values = group["r2"]
+    valid = values.dropna()
+    total = len(values)
+    high_accuracy_count = values.ge(0.9).sum()
+    positive_r2_count = values.gt(0).sum()
+    summary_rows.append(
+        {
+            "train_noise": train_noise,
+            "test_noise": test_noise,
+            "common_id_count": total,
+            "valid_count": len(valid),
+            "invalid_count": values.isna().sum(),
+            "median_r2": valid.median(),
+            "q10_r2": valid.quantile(0.10),
+            "q25_r2": valid.quantile(0.25),
+            "q75_r2": valid.quantile(0.75),
+            "high_accuracy_count": high_accuracy_count,
+            "high_accuracy_rate": high_accuracy_count / total,
+            "positive_r2_count": positive_r2_count,
+            "positive_r2_rate": positive_r2_count / total,
+        }
+    )
+
+summary = pd.DataFrame(summary_rows)
+summary.to_csv(OUT_DIR / "robustness_summary.csv", index=False)
+
+paired_rows = []
+for train_noise in (0.01, 0.03):
+    for test_noise, column in TEST_COLUMNS.items():
+        comparison = pd.DataFrame(
+            {
+                "clean": data[0.00].loc[common_ids, column],
+                "noisy": data[train_noise].loc[common_ids, column],
+            }
+        )
+        valid_pairs = comparison.dropna()
+        delta = valid_pairs["noisy"] - valid_pairs["clean"]
+        paired_rows.append(
+            {
+                "train_noise": train_noise,
+                "test_noise": test_noise,
+                "valid_pair_count": len(valid_pairs),
+                "noisy_invalid_count": comparison["noisy"].isna().sum(),
+                "median_delta_r2": delta.median(),
+                "q10_delta_r2": delta.quantile(0.10),
+                "q90_delta_r2": delta.quantile(0.90),
+                "fraction_delta_positive": delta.gt(0).mean(),
+            }
+        )
+
+paired_summary = pd.DataFrame(paired_rows)
+paired_summary.to_csv(OUT_DIR / "paired_delta_summary.csv", index=False)
+
+
+# 1. Robustness profile and threshold-based reliability.
+fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.2))
+axes = axes.ravel()
+for train_noise in TRAINING_FILES:
+    selected = summary[summary["train_noise"] == train_noise]
+    x = selected["test_noise"].to_numpy()
+    color = COLORS[train_noise]
+    axes[0].plot(
+        x,
+        selected["median_r2"],
+        color=color,
+        marker="o",
+        linewidth=2,
+        label=LABELS[train_noise],
+    )
+    axes[0].fill_between(
+        x,
+        selected["q25_r2"],
+        selected["q75_r2"],
+        color=color,
+        alpha=0.14,
+    )
+    axes[1].plot(
+        x,
+        selected["q10_r2"],
+        color=color,
+        marker="o",
+        linewidth=2,
+        label=LABELS[train_noise],
+    )
+
+axes[0].set_title("(A) Typical performance")
+axes[0].set_ylabel("R² (median; band = IQR)")
+axes[0].set_ylim(0.82, 1.01)
+axes[0].legend(frameon=False, loc="lower left")
+axes[1].set_title("(B) Lower-tail performance")
+axes[1].set_ylabel("10th percentile R²")
+axes[1].set_ylim(0.45, 1.01)
+for axis in axes[:2]:
+    axis.set_xlabel("Testing noise")
+    axis.set_xticks(list(TEST_COLUMNS))
+    axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
+    axis.grid(axis="y", linestyle=":", alpha=0.35)
+
+rate_specs = [
+    (
+        "high_accuracy_rate",
+        "high_accuracy_count",
+        "High-accuracy reliability",
+        "Fraction with R² ≥ 0.9",
+    ),
+    (
+        "positive_r2_rate",
+        "positive_r2_count",
+        "Failure-free reliability",
+        "Fraction with R² > 0",
+    ),
+]
+for panel, axis, (column, count_column, title, ylabel) in zip(
+    ("C", "D"), axes[2:], rate_specs
+):
+    for train_noise in TRAINING_FILES:
+        selected = summary[summary["train_noise"] == train_noise]
+        rates = selected[column].to_numpy()
+        lows, highs = zip(
+            *[
+                wilson_interval(successes, len(common_ids))
+                for successes in selected[count_column]
+            ]
+        )
+        yerr = np.vstack([rates - np.array(lows), np.array(highs) - rates])
+        axis.errorbar(
+            selected["test_noise"],
+            rates,
+            yerr=yerr,
+            color=COLORS[train_noise],
+            marker="o",
+            linewidth=2,
+            capsize=3,
+            label=LABELS[train_noise],
+        )
+    axis.set_title(f"({panel}) {title}")
+    axis.set_ylabel(ylabel)
+    axis.set_xlabel("Testing noise")
+    axis.set_xticks(list(TEST_COLUMNS))
+    axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
+    axis.set_ylim((0.55, 1.02) if column == "high_accuracy_rate" else (0.84, 1.02))
+    axis.grid(axis="y", linestyle=":", alpha=0.35)
+
+fig.suptitle(
+    f"R² robustness and reliability on {len(common_ids)} common equations",
+    y=0.99,
+)
+fig.text(
+    0.5,
+    0.02,
+    "Quantiles use valid evaluations. Error bars are 95% Wilson intervals; "
+    "invalid evaluations count as failures.",
+    ha="center",
+    color="#555555",
+    fontsize=9,
+)
+fig.tight_layout(rect=[0, 0.06, 1, 0.96], h_pad=2.2)
+save_figure(fig, "01_r2_robustness_profile.png")
+
+legacy_rate_figure = OUT_DIR / "02_reliability_rates.png"
+if legacy_rate_figure.exists():
+    legacy_rate_figure.unlink()
+
+
+# 3. Paired changes reveal small typical gains and occasional large losses.
+fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.8), sharey=True)
+rng = np.random.default_rng(7)
+positions = np.arange(len(TEST_COLUMNS))
+for panel, axis, train_noise in zip(("A", "B"), axes, (0.01, 0.03)):
+    for position, (test_noise, column) in zip(positions, TEST_COLUMNS.items()):
+        comparison = pd.DataFrame(
+            {
+                "clean": data[0.00].loc[common_ids, column],
+                "noisy": data[train_noise].loc[common_ids, column],
+            }
+        )
+        valid = comparison.dropna()
+        delta = (valid["noisy"] - valid["clean"]).to_numpy()
+        jitter = rng.uniform(-0.14, 0.14, len(delta))
+        axis.scatter(
+            position + jitter,
+            delta,
+            s=18,
+            color=COLORS[train_noise],
+            alpha=0.55,
+            edgecolors="none",
+        )
+        axis.scatter(
+            position,
+            np.median(delta),
+            s=58,
+            marker="D",
+            color="#111111",
+            zorder=4,
+        )
+        invalid_count = comparison["noisy"].isna().sum()
+        if invalid_count:
+            invalid_x = position + np.linspace(
+                -0.045,
+                0.045,
+                invalid_count,
+            )
+            axis.scatter(
+                invalid_x,
+                [-250] * invalid_count,
+                marker="v",
+                s=55,
+                color="#111111",
+                zorder=5,
+            )
+    axis.axhline(0, color="#333333", linewidth=1)
+    axis.set_yscale("symlog", linthresh=1e-4)
+    axis.set_ylim(-300, 0.05)
+    axis.set_xticks(positions)
+    axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
+    axis.set_xlabel("Testing noise")
+    axis.set_title(f"({panel}) Train noise {train_noise:.2f} vs train noise 0")
+    axis.grid(axis="y", linestyle=":", alpha=0.3)
+axes[0].set_ylabel("Paired ΔR² (noisy training − clean training)")
+axes[0].set_yticks([-100, -10, -1, -0.1, -0.01, -0.001, 0, 0.001, 0.01])
+axes[0].set_yticklabels(
+    ["−100", "−10", "−1", "−0.1", "−0.01", "−0.001", "0", "0.001", "0.01"]
+)
+fig.suptitle("Paired effect of adding training noise", y=1.02)
+fig.text(
+    0.5,
+    -0.02,
+    "Diamonds mark valid-pair medians; triangles at the floor mark failed evaluations.",
+    ha="center",
+    color="#555555",
+    fontsize=9,
+)
+fig.tight_layout()
+save_figure(fig, "03_paired_training_noise_effect.png")
+
+
+# 4. Worst-case score across all testing-noise levels for each equation.
+fig, axis = plt.subplots(figsize=(7.4, 4.8))
+thresholds = np.linspace(0, 1, 401)
+for train_noise, frame in data.items():
+    matrix = frame.loc[common_ids, list(TEST_COLUMNS.values())]
+    worst_case = matrix.fillna(-np.inf).min(axis=1).to_numpy()
+    survival = np.array([(worst_case >= threshold).mean() \
+                         for threshold in thresholds])
+    axis.plot(
+        thresholds,
+        survival,
+        color=COLORS[train_noise],
+        linewidth=2.2,
+        label=LABELS[train_noise],
+    )
+
+axis.axvline(0.9, color="#777777", linestyle="--", linewidth=1)
+axis.set_xlim(0, 1)
+axis.set_ylim(0, 1.02)
+axis.set_xlabel("Required R² at every testing-noise level")
+axis.set_ylabel("Fraction of equations meeting the requirement")
+axis.set_title("Worst-case robustness across all five testing-noise levels")
+axis.grid(linestyle=":", alpha=0.35)
+axis.legend(frameon=False, loc="lower left")
+fig.text(
+    0.5,
+    -0.01,
+    "Each equation is scored by its lowest R²; invalid evaluations count as failures.",
+    ha="center",
+    color="#555555",
+    fontsize=9,
+)
+fig.tight_layout()
+save_figure(fig, "04_worst_case_robustness.png")
+
+
+print(f"Common equations: {len(common_ids)}")
+print(f"Outputs written to: {OUT_DIR}")
+print(summary.to_string(index=False))

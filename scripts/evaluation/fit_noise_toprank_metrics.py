@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit para_eq independently to eight WASS datasets and write mean metrics.
+"""Fit para_eq to noisy datasets in parallel and write one compact table.
 
 For every row whose TopRank equals the requested value, this program:
 1. locates <data-root>/<WASS_K>/<ID>/0.csv ... 7.csv;
@@ -12,15 +12,18 @@ NMSE is defined as MSE / Var(y), equivalently SSE / SST.  If any of an ID's
 eight files fails, that ID receives the configured failure value for MSE and NMSE and
 the negative of that value for R2.  The remaining IDs continue normally.
 
-By default, three independent child processes run WASS_0, WASS_025, and
-WASS_04 respectively.  Each WASS child uses ``--workers`` parallel ID-fitting
-workers, so the maximum number of fitting workers is the number of WASS labels
-times ``--workers``.  Results are saved as
-<input-stem>_WASS_0.csv, <input-stem>_WASS_025.csv, and
-<input-stem>_WASS_04.csv (or with the input Excel extension).
+All requested noise-level/ID combinations share one process pool. ``--workers``
+is therefore the total process limit, not a per-noise limit. The main process
+collects every result and writes exactly one new output file containing only
+ID, TOPK, and the generated error columns. Only rows whose TopRank equals
+``--top-rank`` are included.
 
-Example:
-    python scripts/evaluation/fit_noise_metrics.py results.csv generated/noise \
+If ``--output`` is omitted, the output name is
+<input-stem>_TopK_<value>_noise_metrics.csv/xlsx. The input table is never
+overwritten.
+
+Example (Windows PowerShell):
+    python fit_noise_toprank_metrics.py results.csv "D:\\Feyman_MSSR\\LRS_physicsMDSR" \
         --top-rank 1 --noise 001 01 003 005 --workers 2
 """
 
@@ -28,14 +31,12 @@ from __future__ import annotations
 
 import argparse
 import ast
-import copy
 import keyword
 import math
 import multiprocessing
 import os
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -861,6 +862,171 @@ def run_fits(
     return results
 
 
+def run_all_noise_fits(
+    records: Sequence[tuple[int, Mapping[str, Any]]],
+    noise_roots: Mapping[str, Path],
+    args: argparse.Namespace,
+) -> dict[
+    str,
+    list[tuple[int, str, float, float, float, tuple[str, ...], tuple[str, ...]]],
+]:
+    """Fit every noise-level/ID pair in one shared process pool."""
+    labels = tuple(noise_roots)
+    total_tasks = len(labels) * len(records)
+    total_files = total_tasks * len(DATASET_INDICES)
+    actual_workers = min(args.workers, total_tasks)
+    results_by_label: dict[
+        str,
+        list[
+            tuple[
+                int,
+                str,
+                float,
+                float,
+                float,
+                tuple[str, ...],
+                tuple[str, ...],
+            ]
+        ],
+    ] = {label: [] for label in labels}
+
+    print(
+        f"Starting combined fits: {len(labels)} noise level(s) x "
+        f"{len(records)} row(s) x {len(DATASET_INDICES)} datasets = "
+        f"{total_files} files; total worker processes={actual_workers}",
+        flush=True,
+    )
+    start_time = time.perf_counter()
+    completed_tasks = 0
+    last_report_bucket = -1
+    interactive = sys.stdout.isatty()
+
+    def record_result(
+        label: str,
+        result: tuple[
+            int,
+            str,
+            float,
+            float,
+            float,
+            tuple[str, ...],
+            tuple[str, ...],
+        ],
+    ) -> None:
+        nonlocal completed_tasks, last_report_bucket
+        results_by_label[label].append(result)
+        completed_tasks += 1
+        if not args.progress:
+            return
+        elapsed = max(time.perf_counter() - start_time, 1.0e-9)
+        fraction = completed_tasks / total_tasks
+        rate = completed_tasks / elapsed
+        eta = (total_tasks - completed_tasks) / rate if rate > 0 else math.inf
+        bucket = int(fraction * 20)
+        line = (
+            f"[Progress {fraction * 100:6.2f}%] tasks {completed_tasks}/{total_tasks}, "
+            f"files {completed_tasks * len(DATASET_INDICES)}/{total_files}, "
+            f"current {wass_directory_name(label)}/{result[1]}, "
+            f"elapsed {format_duration(elapsed)}, ETA {format_duration(eta)}"
+        )
+        if interactive:
+            print("\r" + line.ljust(170), end="", flush=True)
+        elif bucket > last_report_bucket or completed_tasks == total_tasks:
+            last_report_bucket = bucket
+            print(line, flush=True)
+
+    def failure_result(
+        position: int,
+        model_id: str,
+        message: str,
+    ) -> tuple[int, str, float, float, float, tuple[str, ...], tuple[str, ...]]:
+        print(f"Warning: {message}; writing failure markers and continuing.", flush=True)
+        return (
+            position,
+            model_id,
+            args.failure_value,
+            args.failure_value,
+            -args.failure_value,
+            (),
+            (message,),
+        )
+
+    if actual_workers == 1:
+        for label in labels:
+            for position, row in records:
+                model_id = str(row.get("ID", "")).strip() or f"table-row-{position + 2}"
+                try:
+                    result = fit_row_task(
+                        position,
+                        row,
+                        str(noise_roots[label]),
+                        args.max_nfev,
+                        args.restarts,
+                        args.seed,
+                        args.strict_symbols,
+                        args.failure_value,
+                    )
+                except Exception as exc:
+                    result = failure_result(
+                        position,
+                        model_id,
+                        f"Unexpected fit failure for noise={wass_directory_name(label)}, "
+                        f"ID={model_id}: {exc}",
+                    )
+                record_result(label, result)
+    else:
+        process_context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=actual_workers,
+            mp_context=process_context,
+        ) as executor:
+            futures = {}
+            for label in labels:
+                for position, row in records:
+                    model_id = str(row.get("ID", "")).strip() or f"table-row-{position + 2}"
+                    future = executor.submit(
+                        fit_row_task,
+                        position,
+                        row,
+                        str(noise_roots[label]),
+                        args.max_nfev,
+                        args.restarts,
+                        args.seed,
+                        args.strict_symbols,
+                        args.failure_value,
+                    )
+                    futures[future] = (label, position, model_id)
+
+            for future in as_completed(futures):
+                label, position, model_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = failure_result(
+                        position,
+                        model_id,
+                        f"Unexpected fit failure for noise={wass_directory_name(label)}, "
+                        f"ID={model_id}: {exc}",
+                    )
+                record_result(label, result)
+
+    if interactive:
+        print(flush=True)
+    elapsed = time.perf_counter() - start_time
+    failed_rows = sum(
+        bool(result[6])
+        for label_results in results_by_label.values()
+        for result in label_results
+    )
+    print(
+        f"Combined fitting complete: {completed_tasks}/{total_tasks} task(s), "
+        f"{total_files} files, failed noise/ID rows marked={failed_rows}, "
+        f"total elapsed {format_duration(elapsed)}",
+        flush=True,
+    )
+    return results_by_label
+
+
 def read_table(path: Path, sheet: str | int) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix == ".csv":
@@ -871,13 +1037,8 @@ def read_table(path: Path, sheet: str | int) -> pd.DataFrame:
     raise FitDataError("The results table must be a .csv, .xlsx, or .xlsm file")
 
 
-def write_table_atomic(
-    frame: pd.DataFrame,
-    source_path: Path,
-    output_path: Path,
-    sheet: str | int,
-    metric_columns: Sequence[str],
-) -> None:
+def write_summary_atomic(frame: pd.DataFrame, output_path: Path) -> None:
+    """Write one standalone CSV/XLSX summary without modifying the input."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
     if suffix == ".csv":
@@ -889,52 +1050,20 @@ def write_table_atomic(
             if temporary.exists():
                 temporary.unlink()
         return
-    if suffix in {".xlsx", ".xlsm"}:
+    if suffix == ".xlsx":
         try:
-            from openpyxl import load_workbook
+            from openpyxl import load_workbook  # noqa: F401
         except ImportError as exc:
-            raise FitDataError("openpyxl is required to process XLSX/XLSM files") from exc
+            raise FitDataError("openpyxl is required to write XLSX files") from exc
         temporary = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
         try:
-            workbook = load_workbook(source_path, keep_vba=source_path.suffix.lower() == ".xlsm")
-            worksheet = (
-                workbook.worksheets[int(sheet)]
-                if isinstance(sheet, str) and sheet.isdigit()
-                else workbook[str(sheet)]
-            )
-            headers = {
-                str(worksheet.cell(1, column).value).strip(): column
-                for column in range(1, worksheet.max_column + 1)
-                if worksheet.cell(1, column).value is not None
-            }
-            for metric_column in metric_columns:
-                if metric_column in headers:
-                    column = headers[metric_column]
-                else:
-                    column = worksheet.max_column + 1
-                    headers[metric_column] = column
-                    worksheet.cell(1, column).value = metric_column
-                    if column > 1:
-                        worksheet.cell(1, column)._style = copy.copy(worksheet.cell(1, column - 1)._style)
-                        worksheet.cell(1, column).font = copy.copy(worksheet.cell(1, column - 1).font)
-                        worksheet.cell(1, column).fill = copy.copy(worksheet.cell(1, column - 1).fill)
-                        worksheet.cell(1, column).border = copy.copy(worksheet.cell(1, column - 1).border)
-                        worksheet.cell(1, column).alignment = copy.copy(worksheet.cell(1, column - 1).alignment)
-                for frame_position, value in enumerate(frame[metric_column], start=2):
-                    cell = worksheet.cell(frame_position, column)
-                    cell.value = None if pd.isna(value) else float(value)
-                    cell.number_format = (
-                        "0.0000000000E+00"
-                        if metric_column.endswith(("_MSE", "_NMSE"))
-                        else "0.0000000000"
-                    )
-            workbook.save(temporary)
+            frame.to_excel(temporary, index=False, engine="openpyxl")
             os.replace(temporary, output_path)
         finally:
             if temporary.exists():
                 temporary.unlink()
         return
-    raise FitDataError(f"Unsupported output format: {output_path.suffix}")
+    raise FitDataError("The output file must have a .csv or .xlsx extension")
 
 
 def validate_columns(frame: pd.DataFrame) -> None:
@@ -947,109 +1076,25 @@ def validate_columns(frame: pd.DataFrame) -> None:
         raise FitDataError(f"The results table is missing columns: {missing}")
 
 
-def append_wass_to_filename(path: Path, wass_label: str) -> Path:
-    """Return result_WASS_K.csv/xlsx without changing the parent directory."""
-    return path.with_name(f"{path.stem}_{wass_label}{path.suffix}")
-
-
-def stream_child_output(label: str, process: subprocess.Popen[str]) -> None:
-    """Prefix each child line so three concurrent logs remain readable."""
-    if process.stdout is None:
-        return
-    for line in process.stdout:
-        print(f"[{label}] {line}", end="", flush=True)
-
-
-def run_multiple_wass_processes(
-    args: argparse.Namespace,
-    table_path: Path,
-    wass_labels: Sequence[str],
-) -> int:
-    """Launch one WASS process per label, each with parallel ID workers."""
-    base_output = args.output.expanduser().resolve() if args.output else table_path
-    if base_output.suffix.lower() != table_path.suffix.lower():
-        raise FitDataError("The --output extension must match the input-table extension")
-
-    jobs: list[tuple[str, Path, list[str]]] = []
-    for label in wass_labels:
-        wass_root = resolve_wass_root(args.data_root, label)
-        if not wass_root.is_dir():
-            raise FileNotFoundError(f"WASS data directory not found: {wass_root}")
-        output_path = append_wass_to_filename(base_output, label)
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            str(table_path),
-            str(args.data_root),
-            "--top-rank", str(args.top_rank),
-            "--noise", label,
-            "--output", str(output_path),
-            "--sheet", str(args.sheet),
-            "--workers", str(args.workers),
-            "--max-nfev", str(args.max_nfev),
-            "--restarts", str(args.restarts),
-            "--seed", str(args.seed),
-            "--failure-value", str(args.failure_value),
-        ]
-        if not args.progress:
-            command.append("--no-progress")
-        if args.strict_symbols:
-            command.append("--strict-symbols")
-        if args.validate_only:
-            command.append("--validate-only")
-        jobs.append((label, output_path, command))
-
-    print(
-        "Starting independent WASS processes: " + ", ".join(
-            f"process {index}={label}" for index, label in enumerate(wass_labels)
-        )
-        + f"; ID workers per WASS={args.workers}; "
-        + f"maximum fitting workers={len(wass_labels) * args.workers}",
-        flush=True,
+def default_output_path(table_path: Path, top_rank: int) -> Path:
+    """Choose a new compact-output filename beside the input table."""
+    suffix = ".xlsx" if table_path.suffix.lower() == ".xlsm" else table_path.suffix
+    return table_path.with_name(
+        f"{table_path.stem}_TopK_{top_rank}_noise_metrics{suffix}"
     )
-    processes: list[tuple[str, Path, subprocess.Popen[str], threading.Thread]] = []
-    for label, output_path, command in jobs:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        reader = threading.Thread(
-            target=stream_child_output,
-            args=(label, process),
-            daemon=True,
-        )
-        reader.start()
-        processes.append((label, output_path, process, reader))
-
-    failures: list[tuple[str, int]] = []
-    for label, _, process, reader in processes:
-        return_code = process.wait()
-        reader.join()
-        if return_code != 0:
-            failures.append((label, return_code))
-    if failures:
-        detail = ", ".join(f"{label}(exit code={code})" for label, code in failures)
-        raise FitDataError(f"One or more WASS processes failed: {detail}")
-
-    if args.validate_only:
-        print("All three WASS processes completed validation.", flush=True)
-    else:
-        print("All three WASS processes completed. Output files:", flush=True)
-        for label, output_path, _, _ in processes:
-            print(f"  {label}: {output_path}", flush=True)
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fit para_eq independently to eight WASS_K datasets and write mean MSE/NMSE/R2 without stopping on individual fit failures"
+        description=(
+            "Fit para_eq to noisy datasets in parallel and write one compact "
+            "file containing ID, TOPK, and mean MSE/NMSE/R2 columns"
+        )
     )
-    parser.add_argument("table", type=Path, help="Input results table (CSV/XLSX); single-WASS mode overwrites it by default")
+    parser.add_argument(
+        "table", type=Path,
+        help="Input results table (CSV/XLSX/XLSM); it is never overwritten",
+    )
     parser.add_argument(
         "data_root", type=Path,
         help=(
@@ -1068,15 +1113,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output", type=Path,
-        help="Exact output path in single-WASS mode; base filename in multi-WASS mode, with _WASS_K appended",
+        help=(
+            "Exact path of the single compact CSV/XLSX output; default: "
+            "<input-stem>_TopK_<value>_noise_metrics.<ext>"
+        ),
     )
     parser.add_argument("--sheet", default="0", help="XLSX worksheet name or zero-based index; default: first worksheet")
     parser.add_argument(
         "--workers", type=int, default=min(4, os.cpu_count() or 1),
-        help=(
-            "Parallel ID workers per WASS label; in multi-WASS mode the "
-            "maximum fitting workers equal number_of_WASS_labels * workers"
-        ),
+        help="Total worker processes shared by all noise-level/ID tasks",
     )
     parser.add_argument("--max-nfev", type=int, default=DEFAULT_MAX_NFEV, help="Maximum function evaluations per least-squares fit")
     parser.add_argument("--restarts", type=int, default=1, help="Initial-value attempts per dataset; default: use orgpara_list once")
@@ -1092,7 +1137,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-progress", dest="progress", action="store_false",
-        help="Disable file-level progress, throughput, elapsed time, and ETA output",
+        help="Disable combined task/file progress, elapsed time, and ETA output",
     )
     parser.set_defaults(progress=True)
     parser.add_argument("--validate-only", action="store_true", help="Validate matching formulas and metadata without fitting")
@@ -1146,43 +1191,62 @@ def main(argv: Sequence[str] | None = None) -> int:
     if inferred_summary:
         preview = "; ".join(f"{model_id}:{'/'.join(names)}" for model_id, names in inferred_summary[:6])
         print(f"Note: additional physical parameters inferred from ParameterRange: {preview}")
-    if len(wass_labels) > 1:
-        return run_multiple_wass_processes(args, table_path, wass_labels)
-    args.noise = wass_labels[0]
     if args.validate_only:
+        print("Validation complete; no output file was written.", flush=True)
         return 0
 
-    wass_root = resolve_wass_root(args.data_root, args.noise)
-    if not wass_root.is_dir():
-        raise FileNotFoundError(f"WASS data directory not found: {wass_root}")
-    metric_prefix = f"noise_{wass_directory_name(args.noise)}"
-    mse_column = f"{metric_prefix}_MSE"
-    nmse_column = f"{metric_prefix}_NMSE"
-    r2_column = f"{metric_prefix}_R2"
-    if mse_column not in frame.columns:
-        frame[mse_column] = np.nan
-    if nmse_column not in frame.columns:
-        frame[nmse_column] = np.nan
-    if r2_column not in frame.columns:
-        frame[r2_column] = np.nan
+    noise_roots: dict[str, Path] = {}
+    for label in wass_labels:
+        root = resolve_wass_root(args.data_root, label)
+        if not root.is_dir():
+            raise FileNotFoundError(f"Noise data directory not found: {root}")
+        noise_roots[label] = root
 
-    results = run_fits(records, wass_root, args)
+    results_by_label = run_all_noise_fits(records, noise_roots, args)
+    summary = frame.iloc[positions][["ID"]].copy().reset_index(drop=True)
+    summary["TOPK"] = args.top_rank
 
-    for position, _, mean_mse, mean_nmse, mean_r2, _, _ in results:
-        frame.at[frame.index[position], mse_column] = mean_mse
-        frame.at[frame.index[position], nmse_column] = mean_nmse
-        frame.at[frame.index[position], r2_column] = mean_r2
-    output_path = args.output.expanduser().resolve() if args.output else table_path
-    if output_path.suffix.lower() != table_path.suffix.lower():
-        raise FitDataError("The --output extension must match the input-table extension")
+    metric_columns: list[str] = []
+    for label in wass_labels:
+        directory_name = wass_directory_name(label)
+        metric_prefix = f"noise_{directory_name}"
+        mse_column = f"{metric_prefix}_MSE"
+        nmse_column = f"{metric_prefix}_NMSE"
+        r2_column = f"{metric_prefix}_R2"
+        metric_columns.extend((mse_column, nmse_column, r2_column))
+
+        result_by_position = {
+            result[0]: result for result in results_by_label[label]
+        }
+        missing_results = [
+            position for position in positions if position not in result_by_position
+        ]
+        if missing_results:
+            raise FitDataError(
+                f"Internal error: missing fit results for table positions {missing_results}"
+            )
+        summary[mse_column] = [
+            result_by_position[position][2] for position in positions
+        ]
+        summary[nmse_column] = [
+            result_by_position[position][3] for position in positions
+        ]
+        summary[r2_column] = [
+            result_by_position[position][4] for position in positions
+        ]
+
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output
+        else default_output_path(table_path, args.top_rank)
+    )
+    if output_path == table_path:
+        raise FitDataError("--output must be a new file; the input table cannot be overwritten")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        write_table_atomic(
-            frame, table_path, output_path, args.sheet,
-            (mse_column, nmse_column, r2_column),
-        )
+        write_summary_atomic(summary[["ID", "TOPK", *metric_columns]], output_path)
     print(
-        f"Write complete: {mse_column}, {nmse_column}, {r2_column} "
+        f"Write complete: {len(summary)} row(s), {len(metric_columns)} metric column(s) "
         f"-> {output_path}"
     )
     return 0

@@ -140,6 +140,7 @@ existing CSV tree unless `--force` is supplied.
 │   ├── evaluation/             Shared and robustness fitting
 │   └── reporting/              Candidate merging and plots
 ├── physicsMDSR_Range.xlsx      Main benchmark metadata
+├── physicsMDSR_Range_20_59.xlsx Optional P20–P59 benchmark subset
 ├── physicsMDSR_WASS_varRanges.xlsx
 ├── physicsMDSR_Range_CSV/      Checked-in/generated base CSV tree
 └── results/                    Default pipeline result location
@@ -242,10 +243,11 @@ python scripts/data/generate_mdsr_testsets.py \
   --wass WASS_025 --output-root generated/wass/WASS_025
 ```
 
-#### `scripts/data/add_target_noise_0_7.py`
+#### `scripts/data/add_target_noise.py`
 
-Creates reproducible multiplicative-Gaussian-noise copies of datasets `0–7`.
-For every target row and noise level `n`, it independently samples and applies:
+Creates reproducible Gaussian-noise copies of a configurable inclusive dataset
+range, defaulting to `0–7`. In relative mode, every target row independently
+samples and applies:
 
 ```text
 epsilon ~ Normal(0, n²)
@@ -254,12 +256,18 @@ noisy_target = target × (1 + epsilon)
 
 The default levels are `0.01`, `0.03`, `0.05`, and `0.1`, stored in directories
 `001`, `003`, `005`, and `01`. Random streams are deterministically derived
-from `--seed`, noise level, problem ID, and dataset filename.
+from `--seed`, noise level, problem ID, and dataset filename. The additional
+`dataset-std` and `absolute` modes apply additive noise. Use `--dataset-start`
+and `--dataset-end` to select another contiguous source range; outputs are
+renumbered from `0.csv`.
 
 ```bash
-python scripts/data/add_target_noise_0_7.py \
+python scripts/data/add_target_noise.py \
   physicsMDSR_Range.xlsx physicsMDSR_Range_CSV generated/noise
 ```
+
+The optional `physicsMDSR_Range_20_59.xlsx` workbook can be passed in place of
+the main workbook when only the P20–P59 subset should be processed.
 
 ### 2. Formula discovery
 
@@ -347,16 +355,20 @@ python scripts/evaluation/fit_wass_metrics.py \
   --top-rank 1 --wass WASS_0 WASS_025 WASS_04 --workers 2
 ```
 
-#### `scripts/evaluation/fit_noise_metrics.py`
+#### `scripts/evaluation/fit_noise_toprank_metrics.py`
 
 Uses the same bounded least-squares fitting implementation as the WASS evaluator
 but reads the value-named noisy-target directories produced by
-`add_target_noise_0_7.py`.
+`add_target_noise.py`. All noise-level/ID combinations share one process pool,
+so `--workers` is the total process limit. It writes one compact table containing
+only `ID`, `TOPK`, and the generated metric columns, without overwriting its
+input table.
 
 ```bash
-python scripts/evaluation/fit_noise_metrics.py \
+python scripts/evaluation/fit_noise_toprank_metrics.py \
   results/top_shared_formulas.csv generated/noise \
-  --top-rank 1 --noise 001 003 005 01 --workers 2
+  --top-rank 1 --noise 001 003 005 01 --workers 2 \
+  --output results/noise_metrics.csv
 ```
 
 Both robustness fitters use large finite failure markers so one invalid formula

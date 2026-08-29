@@ -215,14 +215,14 @@ def robustness(config: Config) -> None:
 
     run(config, [
         config.python,
-        PROJECT_ROOT / "scripts/data/add_target_noise_0_7.py",
+        PROJECT_ROOT / "scripts/data/add_target_noise.py",
         config.workbook,
         config.data_root,
         config.generated_root / "noise",
     ])
     run(config, [
         config.python,
-        PROJECT_ROOT / "scripts/evaluation/fit_noise_metrics.py",
+        PROJECT_ROOT / "scripts/evaluation/fit_noise_toprank_metrics.py",
         config.candidates,
         config.generated_root / "noise",
         "--top-rank", config.top_rank,

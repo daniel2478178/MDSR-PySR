@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-"""Create reproducible multiplicative-Gaussian-noise target datasets.
+"""Create CSV datasets with reproducible Gaussian noise on the target.
 
-For every ID in the metadata workbook, the program processes only the files
-DATA_FOLDER/ID/0.csv through DATA_FOLDER/ID/7.csv.  Other filenames and CSVs
-inside nested directories are ignored. For each requested noise standard
-deviation n, it writes a copy below NOISE_FOLDER/<noise-value>/ID and applies:
+For every ID in the metadata workbook, the program processes a configurable
+inclusive range of directly contained CSV files. The default range is
+DATA_FOLDER/ID/0.csv through DATA_FOLDER/ID/7.csv. Use ``--dataset-start`` and
+``--dataset-end`` to change it, for example ``--dataset-end 15`` for 0..15.csv.
+Other filenames and CSVs inside nested directories are ignored. For each
+requested noise amplitude n, it writes a corresponding copy below
+NOISE_FOLDER/<noise-value>/ID. Output files are renumbered from zero: the input
+file at ``--dataset-start`` becomes 0.csv, the next becomes 1.csv, and so on.
 
-    epsilon ~ Normal(0, n**2)
-    noisy_target = target_value * (1 + epsilon)
+The default noise model is relative Gaussian noise:
 
-A separate epsilon is sampled for every row. Random streams are derived from
-the base seed, noise level, ID, and dataset filename, so reruns are identical.
+    noisy_target = target * (1 + n * Z),  Z ~ Normal(0, 1)
+
+Thus n is the one-standard-deviation relative amplitude: n=0.03 means 3%
+Gaussian noise. Two additional modes are available:
+
+    dataset-std: noisy_target = target + n * std(target_column) * Z
+    absolute:    noisy_target = target + n * Z
+
+Use ``--seed`` to reproduce exactly the same noise. Each output file gets a
+stable, independent random stream, so adding or removing another input file
+does not change its generated values.
 
 The target column name is read from the workbook's ``Target`` column.  Thus an
 ID whose Target value is ``v`` modifies the CSV column named ``v``.
@@ -27,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import math
 import random
 import sys
 from dataclasses import dataclass
@@ -43,9 +56,9 @@ except ImportError as exc:  # pragma: no cover - depends on the user's machine
 
 
 DEFAULT_NOISES = "n1=0.01,n2=0.03,n3=0.05,n4=0.1"
-DEFAULT_SEED = 20260825
+DEFAULT_DATASET_START = 0
+DEFAULT_DATASET_END = 7
 ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
-DATASET_INDICES = tuple(range(8))
 
 
 @dataclass(frozen=True)
@@ -187,16 +200,10 @@ def inspect_csv(path: Path, relative_path: Path, target: str) -> CsvInfo:
     return CsvInfo(path, relative_path, encoding, dialect, actual_target)
 
 
-def noisy_number(
-    text: str,
-    noise: Decimal,
-    rng: random.Random,
-    path: Path,
-    row_number: int,
-) -> str:
+def parse_number(text: str, path: Path, row_number: int) -> float | None:
     stripped = text.strip()
     if stripped == "":
-        return text
+        return None
     try:
         value = Decimal(stripped)
     except InvalidOperation as exc:
@@ -205,80 +212,143 @@ def noisy_number(
         ) from exc
     if not value.is_finite():
         raise ValueError(f"Non-finite target value {text!r} in {path}, CSV row {row_number}.")
-    epsilon = Decimal(str(rng.gauss(0.0, float(noise))))
-    result = value * (Decimal(1) + epsilon)
-    if result == 0:
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError(
+            f"Target value {text!r} is outside the supported floating-point range "
+            f"in {path}, CSV row {row_number}."
+        )
+    return converted
+
+
+def format_number(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError(f"Noise generation produced a non-finite value: {value!r}")
+    if value == 0:
         return "0"
-    return str(result.normalize())
+    return format(value, ".17g")
 
 
-def noise_rng(
-    base_seed: int,
-    noise: Decimal,
-    item_id: str,
-    relative_path: Path,
-) -> random.Random:
-    key = f"{base_seed}|{noise.normalize()}|{item_id}|{relative_path.as_posix()}"
-    digest = hashlib.sha256(key.encode("utf-8")).digest()
-    return random.Random(int.from_bytes(digest[:16], "big"))
+def stable_rng(seed: int, noise: Decimal, info: CsvInfo) -> random.Random:
+    """Return an order-independent RNG for one noise level and source file."""
+    source_key = f"{info.source.parent.name}/{info.relative_to_id.as_posix()}"
+    canonical_noise = format(noise.normalize(), "f")
+    key = f"{seed}\0{canonical_noise}\0{source_key}".encode("utf-8")
+    derived_seed = int.from_bytes(hashlib.sha256(key).digest()[:16], "big")
+    return random.Random(derived_seed)
+
+
+def noise_scale(values: list[float], amplitude: float, mode: str) -> float:
+    if mode == "absolute":
+        return amplitude
+    if mode == "dataset-std":
+        if len(values) < 2:
+            return 0.0
+        mean = math.fsum(values) / len(values)
+        variance = math.fsum((value - mean) ** 2 for value in values) / len(values)
+        return amplitude * math.sqrt(variance)
+    raise ValueError(f"Unsupported fixed noise scale mode: {mode}")
 
 
 def write_noisy_csv(
     info: CsvInfo,
     destination: Path,
     noise: Decimal,
-    rng: random.Random,
+    mode: str,
+    seed: int,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    amplitude = float(noise)
+    if not math.isfinite(amplitude):
+        raise ValueError(f"Noise amplitude is outside the supported range: {noise}")
+    rng = stable_rng(seed, noise, info)
 
     with info.source.open("r", encoding=info.encoding, newline="") as source_handle:
         reader = csv.DictReader(source_handle, dialect=info.dialect)
         if reader.fieldnames is None:
             raise ValueError(f"CSV file has no header: {info.source}")
-        with destination.open("w", encoding=info.encoding, newline="") as output_handle:
-            writer = csv.DictWriter(
-                output_handle,
-                fieldnames=reader.fieldnames,
-                dialect=info.dialect,
-                extrasaction="raise",
-            )
-            writer.writeheader()
-            for row_number, row in enumerate(reader, start=2):
-                row[info.target_column] = noisy_number(
-                    row[info.target_column], noise, rng, info.source, row_number
-                )
-                writer.writerow(row)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+
+    parsed_targets = [
+        parse_number(row[info.target_column], info.source, row_number)
+        for row_number, row in enumerate(rows, start=2)
+    ]
+    non_empty_targets = [value for value in parsed_targets if value is not None]
+    fixed_scale = (
+        None if mode == "relative" else noise_scale(non_empty_targets, amplitude, mode)
+    )
+
+    with destination.open("w", encoding=info.encoding, newline="") as output_handle:
+        writer = csv.DictWriter(
+            output_handle,
+            fieldnames=fieldnames,
+            dialect=info.dialect,
+            extrasaction="raise",
+        )
+        writer.writeheader()
+        for row, target in zip(rows, parsed_targets):
+            if target is not None:
+                if mode == "relative":
+                    noisy_target = target * (1.0 + rng.gauss(0.0, amplitude))
+                else:
+                    assert fixed_scale is not None
+                    noisy_target = target + rng.gauss(0.0, fixed_scale)
+                row[info.target_column] = format_number(noisy_target)
+            writer.writerow(row)
 
 
 def collect_csv_files(
-    data_folder: Path, id_targets: dict[str, str]
+    data_folder: Path,
+    id_targets: dict[str, str],
+    dataset_indices: Iterable[int],
 ) -> tuple[list[CsvInfo], list[str]]:
     files: list[CsvInfo] = []
     warnings: list[str] = []
+    indices = tuple(dataset_indices)
+    if not indices:
+        raise ValueError("The dataset index range is empty.")
 
     for item_id, target in id_targets.items():
         id_folder = data_folder / item_id
         if not id_folder.is_dir():
             warnings.append(f"ID folder not found: {id_folder}")
             continue
-        # Process only the eight directly contained files 0.csv ... 7.csv.
-        # Files such as 8.csv, result.csv, and nested/0.csv are ignored.
+        # Process only the selected directly contained numbered CSV files.
+        # Files outside the requested range and files in nested folders are ignored.
         csv_paths = [
             id_folder / f"{dataset_index}.csv"
-            for dataset_index in DATASET_INDICES
+            for dataset_index in indices
             if (id_folder / f"{dataset_index}.csv").is_file()
         ]
         if not csv_paths:
-            warnings.append(f"No files named 0.csv through 7.csv found in: {id_folder}")
+            warnings.append(
+                f"No files named {indices[0]}.csv through {indices[-1]}.csv "
+                f"found in: {id_folder}"
+            )
             continue
         for csv_path in csv_paths:
             files.append(inspect_csv(csv_path, csv_path.relative_to(id_folder), target))
     return files, warnings
 
 
+def renumbered_output_path(info: CsvInfo, dataset_start: int) -> Path:
+    """Map the selected input range to consecutive output names from 0.csv."""
+    try:
+        source_index = int(info.relative_to_id.stem)
+    except ValueError as exc:
+        raise ValueError(f"Dataset filename is not numeric: {info.source.name}") from exc
+    output_index = source_index - dataset_start
+    if output_index < 0:
+        raise ValueError(
+            f"Dataset index {source_index} is below --dataset-start={dataset_start}"
+        )
+    return Path(f"{output_index}.csv")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Add reproducible multiplicative Gaussian noise to CSV targets."
+        description="Add reproducible Gaussian noise to each ID's CSV target column."
     )
     parser.add_argument("metadata_file", type=Path, help="Excel file containing ID and Target columns")
     parser.add_argument("data_folder", type=Path, help="Input root containing one folder per ID")
@@ -287,15 +357,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--noises",
         default=DEFAULT_NOISES,
         help=(
-            "Comma-separated relative standard deviations or labels "
+            "Comma-separated Gaussian standard-deviation amplitudes or labels "
             f"(default: {DEFAULT_NOISES})"
+        ),
+    )
+    parser.add_argument(
+        "--noise-mode",
+        choices=("relative", "dataset-std", "absolute"),
+        default="relative",
+        help=(
+            "Amplitude interpretation: relative gives target*(1+n*Z); "
+            "dataset-std gives target+n*std(target)*Z; absolute gives target+n*Z "
+            "(default: relative)"
         ),
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=DEFAULT_SEED,
-        help=f"Base random seed (default: {DEFAULT_SEED})",
+        default=20260825,
+        help="Base random seed for reproducible noise (default: 20260825)",
+    )
+    parser.add_argument(
+        "--dataset-start",
+        type=int,
+        default=DEFAULT_DATASET_START,
+        help=f"First dataset index, inclusive (default: {DEFAULT_DATASET_START})",
+    )
+    parser.add_argument(
+        "--dataset-end",
+        type=int,
+        default=DEFAULT_DATASET_END,
+        help=f"Last dataset index, inclusive (default: {DEFAULT_DATASET_END})",
     )
     parser.add_argument(
         "--sheet",
@@ -314,13 +406,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         noises = parse_noise_list(args.noises)
+        if args.dataset_start < 0:
+            raise ValueError("--dataset-start must be non-negative.")
+        if args.dataset_end < args.dataset_start:
+            raise ValueError("--dataset-end must be greater than or equal to --dataset-start.")
+        dataset_indices = range(args.dataset_start, args.dataset_end + 1)
         if not args.metadata_file.is_file():
             raise ValueError(f"Metadata file not found: {args.metadata_file}")
         if not args.data_folder.is_dir():
             raise ValueError(f"Data folder not found: {args.data_folder}")
 
         id_targets = load_id_targets(args.metadata_file, args.sheet)
-        csv_files, warnings = collect_csv_files(args.data_folder, id_targets)
+        csv_files, warnings = collect_csv_files(
+            args.data_folder,
+            id_targets,
+            dataset_indices,
+        )
 
         for warning in warnings:
             print(f"Warning: {warning}", file=sys.stderr)
@@ -335,15 +436,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             level_folder = args.noise_folder / noise_directory_name(noise)
             for info in csv_files:
                 item_id = info.source.relative_to(args.data_folder).parts[0]
-                destination = level_folder / item_id / info.relative_to_id
-                rng = noise_rng(args.seed, noise, item_id, info.relative_to_id)
-                write_noisy_csv(info, destination, noise, rng)
+                destination = (
+                    level_folder
+                    / item_id
+                    / renumbered_output_path(info, args.dataset_start)
+                )
+                write_noisy_csv(
+                    info,
+                    destination,
+                    noise,
+                    args.noise_mode,
+                    args.seed,
+                )
                 written += 1
 
         print(
             f"Done: {len(csv_files)} source CSV file(s) x {len(noises)} noise level(s) "
             f"= {written} output file(s)."
         )
+        print(f"Dataset range: {args.dataset_start}.csv through {args.dataset_end}.csv")
+        print(
+            "Output numbering: 0.csv through "
+            f"{args.dataset_end - args.dataset_start}.csv"
+        )
+        print(f"Noise mode: {args.noise_mode}; seed: {args.seed}")
         for noise in noises:
             print(f"  {noise} -> {args.noise_folder / noise_directory_name(noise)}")
         return 0
