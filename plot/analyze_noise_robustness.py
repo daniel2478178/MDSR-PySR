@@ -1,13 +1,44 @@
-from pathlib import Path
+import argparse
 import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
 BASE_DIR = Path(__file__).resolve().parent
-OUT_DIR = BASE_DIR / "noise_robustness_figures"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Analyze robustness across training-noise levels.",
+    )
+    parser.add_argument(
+        "--clean-training",
+        type=Path,
+        default=BASE_DIR / "不带参数.xlsx",
+    )
+    parser.add_argument(
+        "--noise-001-training",
+        type=Path,
+        default=BASE_DIR / "噪声001统计表(1).xlsx",
+    )
+    parser.add_argument(
+        "--noise-003-training",
+        type=Path,
+        default=BASE_DIR / "噪声003统计表.xlsx",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=BASE_DIR / "noise_robustness_figures",
+    )
+    return parser
+
+
+args = build_parser().parse_args()
+OUT_DIR = args.output_dir.resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PLOT_CACHE = Path(tempfile.gettempdir()) / "mdsr_plot_cache"
@@ -22,12 +53,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 TRAINING_FILES = {
-    0.00: BASE_DIR / "不带参数.xlsx",
-    0.01: BASE_DIR / "噪声001统计表(1).xlsx",
-    0.03: BASE_DIR / "噪声003统计表.xlsx",
+    0.00: args.clean_training.resolve(),
+    0.01: args.noise_001_training.resolve(),
+    0.03: args.noise_003_training.resolve(),
 }
 TEST_COLUMNS = {
     0.00: "noise_0_R2",
@@ -73,21 +106,6 @@ def load_workbook(path):
         frame[column] = values.mask(values <= FAILURE_SENTINEL)
 
     return frame
-
-
-def wilson_interval(successes, total, z=1.96):
-    proportion = successes / total
-    denominator = 1 + z**2 / total
-    center = (proportion + z**2 / (2 * total)) / denominator
-    margin = (
-        z
-        * np.sqrt(
-            proportion * (1 - proportion) / total
-            + z**2 / (4 * total**2)
-        )
-        / denominator
-    )
-    return center - margin, center + margin
 
 
 def save_figure(fig, filename):
@@ -208,7 +226,6 @@ for train_noise in TRAINING_FILES:
 axes[0].set_title("(A) Typical performance")
 axes[0].set_ylabel("R² (median; band = IQR)")
 axes[0].set_ylim(0.82, 1.01)
-axes[0].legend(frameon=False, loc="lower left")
 axes[1].set_title("(B) Lower-tail performance")
 axes[1].set_ylabel("10th percentile R²")
 axes[1].set_ylim(0.45, 1.01)
@@ -221,38 +238,27 @@ for axis in axes[:2]:
 rate_specs = [
     (
         "high_accuracy_rate",
-        "high_accuracy_count",
         "High-accuracy reliability",
         "Fraction with R² ≥ 0.9",
     ),
     (
         "positive_r2_rate",
-        "positive_r2_count",
         "Failure-free reliability",
         "Fraction with R² > 0",
     ),
 ]
-for panel, axis, (column, count_column, title, ylabel) in zip(
+for panel, axis, (column, title, ylabel) in zip(
     ("C", "D"), axes[2:], rate_specs
 ):
     for train_noise in TRAINING_FILES:
         selected = summary[summary["train_noise"] == train_noise]
         rates = selected[column].to_numpy()
-        lows, highs = zip(
-            *[
-                wilson_interval(successes, len(common_ids))
-                for successes in selected[count_column]
-            ]
-        )
-        yerr = np.vstack([rates - np.array(lows), np.array(highs) - rates])
-        axis.errorbar(
+        axis.plot(
             selected["test_noise"],
             rates,
-            yerr=yerr,
             color=COLORS[train_noise],
             marker="o",
             linewidth=2,
-            capsize=3,
             label=LABELS[train_noise],
         )
     axis.set_title(f"({panel}) {title}")
@@ -263,20 +269,59 @@ for panel, axis, (column, count_column, title, ylabel) in zip(
     axis.set_ylim((0.55, 1.02) if column == "high_accuracy_rate" else (0.84, 1.02))
     axis.grid(axis="y", linestyle=":", alpha=0.35)
 
+color_handles, color_labels = axes[0].get_legend_handles_labels()
+
+line_handle = Line2D(
+    [0],
+    [0],
+    color="#333333",
+    marker="o",
+    linewidth=2,
+)
+axes[0].legend(
+    handles=[
+        line_handle,
+        Patch(facecolor="#777777", alpha=0.20),
+    ],
+    labels=[
+        "Line/markers: median R²",
+        "Shaded band: IQR",
+    ],
+    loc="lower left",
+    fontsize=8,
+)
+axes[1].legend(
+    handles=[line_handle],
+    labels=["Line/markers: 10th-percentile R²"],
+    loc="lower left",
+    fontsize=8,
+)
+axes[2].legend(
+    handles=[line_handle],
+    labels=["Line/markers: fraction with R² ≥ 0.9"],
+    loc="lower left",
+    fontsize=8,
+)
+axes[3].legend(
+    handles=[line_handle],
+    labels=["Line/markers: fraction with R² > 0"],
+    loc="lower left",
+    fontsize=8,
+)
+
 fig.suptitle(
-    f"R² robustness and reliability on {len(common_ids)} common equations",
+    "R² robustness and reliability",
     y=0.99,
 )
-fig.text(
-    0.5,
-    0.02,
-    "Quantiles use valid evaluations. Error bars are 95% Wilson intervals; "
-    "invalid evaluations count as failures.",
-    ha="center",
-    color="#555555",
-    fontsize=9,
+fig.legend(
+    color_handles,
+    color_labels,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.95),
+    ncol=3,
+    frameon=False,
 )
-fig.tight_layout(rect=[0, 0.06, 1, 0.96], h_pad=2.2)
+fig.tight_layout(rect=[0, 0.02, 1, 0.93], h_pad=2.2)
 save_figure(fig, "01_r2_robustness_profile.png")
 
 legacy_rate_figure = OUT_DIR / "02_reliability_rates.png"

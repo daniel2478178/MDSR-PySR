@@ -1,0 +1,14 @@
+name: mdsr-pysr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - matplotlib>=3.8
+  - numpy>=1.26
+  - openpyxl>=3.1
+  - pandas>=2.1
+  - scipy>=1.11
+  - sympy>=1.12
+  - pip
+  - pip:
+      - pysr

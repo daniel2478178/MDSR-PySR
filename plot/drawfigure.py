@@ -1,9 +1,25 @@
-from pathlib import Path
-from collections import Counter
+import argparse
 import math
+import os
+import tempfile
+from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+PLOT_CACHE = Path(tempfile.gettempdir()) / "mdsr_plot_cache"
+PLOT_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(PLOT_CACHE / "matplotlib"),
+)
+os.environ.setdefault("XDG_CACHE_HOME", str(PLOT_CACHE))
+
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import LogFormatterSciNotation, MaxNLocator
@@ -18,16 +34,46 @@ plt.rcParams["ytick.direction"] = "in"
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
-input_path = BASE_DIR / "不带参数.xlsx"
-with_parameter_input_path = (
-    BASE_DIR / "带参数统计表格(1).xlsx"
-)
-perfect_fit_input_path = Path(
-    "/Users/daniel/equation_verfication/"
-    "physicsMDSR_Range_GenerationFormula_noise_metrics.xlsx"
-)
-out_dir = BASE_DIR / "mdsr_figures"
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate the MDSR summary figures.",
+    )
+    parser.add_argument(
+        "--without-parameters",
+        type=Path,
+        default=BASE_DIR / "不带参数.xlsx",
+    )
+    parser.add_argument(
+        "--with-parameters",
+        type=Path,
+        default=BASE_DIR / "带参数统计表格(1).xlsx",
+    )
+    parser.add_argument(
+        "--perfect-fit",
+        type=Path,
+        default=(
+            PROJECT_ROOT
+            / "equation_verfication"
+            / "physicsMDSR_Range_GenerationFormula_noise_metrics.xlsx"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=BASE_DIR / "mdsr_figures",
+    )
+    return parser
+
+
+args = build_parser().parse_args()
+
+input_path = args.without_parameters.resolve()
+with_parameter_input_path = args.with_parameters.resolve()
+perfect_fit_input_path = args.perfect_fit.resolve()
+out_dir = args.output_dir.resolve()
 
 out_dir.mkdir(
     parents=True,
@@ -1432,10 +1478,10 @@ dataset_handles = [
         [0],
         [0],
         color="0.35",
-        linestyle="--",
+        linestyle=(0, (2, 1.5)),
         marker="s",
         markerfacecolor="white",
-        linewidth=1.8,
+        linewidth=2.4,
         label="Without parameters",
     ),
     Line2D(
@@ -1448,21 +1494,25 @@ dataset_handles = [
     ),
 ]
 
-threshold_legend = ax_zoom.legend(
+fig.legend(
     handles=threshold_handles,
     title="Threshold",
-    loc="upper left",
+    loc="upper center",
+    bbox_to_anchor=(0.27, 0.90),
+    ncol=3,
 )
-ax_zoom.add_artist(
-    threshold_legend
-)
-ax_zoom.legend(
+fig.legend(
     handles=dataset_handles,
     title="Dataset",
-    loc="lower left",
+    loc="upper center",
+    bbox_to_anchor=(0.74, 0.90),
+    ncol=2,
+    handlelength=4.0,
 )
 
-fig.tight_layout()
+fig.tight_layout(
+    rect=(0, 0, 1, 0.84),
+)
 
 f4 = (
     out_dir
@@ -1820,7 +1870,7 @@ fig = plt.figure(
 outer_grid = fig.add_gridspec(
     nrows=2,
     height_ratios=[1, 1],
-    hspace=0.30,
+    hspace=0.10,
 )
 
 r2_grid = outer_grid[0].subgridspec(
@@ -2140,8 +2190,8 @@ combined_plots = [
         r2_distribution_labels,
         without_parameter_r2_counts,
         with_parameter_r2_counts,
-        r"Shared-fit $R^2$ range",
-        r"(A) Distribution of shared-fit $R^2$ values",
+        r"$R^2$ range",
+        r"(A) Distribution of $R^2$ values",
         0,
     ),
     (

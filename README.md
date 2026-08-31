@@ -49,14 +49,23 @@ resolution and stage orchestration live in Python.
 - Matplotlib
 - PySR, including its Julia/SymbolicRegression backend
 
-Install the Python dependencies in the environment that will run the pipeline:
+Conda is the recommended setup because PySR also manages a Julia backend:
 
 ```bash
-python -m pip install numpy pandas scipy sympy openpyxl matplotlib pysr
+conda env create -f environment.yml
+conda activate mdsr-pysr
 ```
 
-PySR is only required for the two discovery scripts. It is imported lazily, so
-the remaining parsers and utilities can still be inspected without PySR.
+For plotting, data preparation, evaluation, and tests without PySR:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Install `requirements-pysr.txt` instead when formula discovery is needed. PySR
+is imported lazily, so the rest of the repository works without it.
 
 ## Quick start
 
@@ -134,11 +143,16 @@ existing CSV tree unless `--force` is supplied.
 .
 ├── main.py                     Pipeline orchestrator
 ├── pipeline.sh                 Thin launcher for main.py
+├── requirements.txt            Plotting and evaluation dependencies
+├── requirements-pysr.txt       Optional PySR discovery dependency
+├── environment.yml              Reproducible Conda environment
 ├── scripts/
 │   ├── data/                   Base, WASS, and scaled-target data generation
 │   ├── discovery/              PySR candidate discovery
 │   ├── evaluation/             Shared and robustness fitting
 │   └── reporting/              Candidate merging and plots
+├── plot/                       Publication-figure scripts and inputs
+├── tests/                      Lightweight configuration tests
 ├── physicsMDSR_Range.xlsx      Main benchmark metadata
 ├── physicsMDSR_Range_20_59.xlsx Optional P20–P59 benchmark subset
 ├── physicsMDSR_WASS_varRanges.xlsx
@@ -411,6 +425,37 @@ python scripts/reporting/plot_metric_histograms.py \
 The repository currently contains the structural-evaluation workbooks as input
 artifacts; it does not contain the step that originally assigned their
 human-readable structural-similarity explanations and scores.
+
+#### Publication figures
+
+The publication-figure scripts use repository-relative input defaults and
+accept path overrides through their command-line interfaces:
+
+```bash
+python plot/drawfigure.py
+python plot/analyze_noise_robustness.py
+```
+
+By default, these write to `plot/mdsr_figures/` and
+`plot/noise_robustness_figures/`. Use `--output-dir` to render elsewhere; use
+`--help` to list every workbook override. For example:
+
+```bash
+python plot/drawfigure.py \
+  --perfect-fit equation_verfication/physicsMDSR_Range_GenerationFormula_noise_metrics.xlsx \
+  --output-dir /tmp/mdsr-figures
+```
+
+## Verification
+
+Run the fast repository checks before a long experiment:
+
+```bash
+python -m unittest discover -v
+./pipeline.sh core --mode xonly --dry-run
+python plot/drawfigure.py --help
+python plot/analyze_noise_robustness.py --help
+```
 
 ## Process tuning
 

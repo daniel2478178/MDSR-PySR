@@ -5,3 +5,13 @@ PhysicsMDRS
 */.DS_Store
 .DS_Store
 
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local generated pipeline data
+generated/
