@@ -35,6 +35,39 @@ plt.rcParams["ytick.direction"] = "in"
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+EXPECTED_TASK_IDS = [f"P{number:02d}" for number in range(1, 60)]
+FAILURE_SENTINEL = -np.inf
+FIGURE_HEIGHT_SCALE = 1.25
+
+
+def taller_figsize(width, height):
+    return width, height * FIGURE_HEIGHT_SCALE
+
+
+A4_FIGSIZE = taller_figsize(190 / 25.4, 78 / 25.4)
+A4_LANDSCAPE_FIGSIZE = taller_figsize(267 / 25.4, 78 / 25.4)
+A4_DPI = 800
+
+
+def format_a4_figure(fig):
+    """Keep the three paired figures readable at portrait A4 print width."""
+    for ax in fig.axes:
+        ax.title.set_fontsize(8)
+        ax.xaxis.label.set_fontsize(8)
+        ax.yaxis.label.set_fontsize(8)
+        ax.tick_params(labelsize=7)
+        for text in ax.texts:
+            text.set_fontsize(7)
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_fontsize(7)
+        for line in ax.lines:
+            line.set_linewidth(1.2)
+            line.set_markersize(4)
+        for collection in ax.collections:
+            if isinstance(collection, matplotlib.collections.PathCollection):
+                collection.set_sizes([15])
 
 
 def build_parser():
@@ -124,6 +157,7 @@ required_columns = [
     "ID",
     "structure_similarity_score",
     "structure_similarity_level",
+    "complexity",
     "simp_complexity",
     "shared_fit_r2_0_7",
     "WASS_0_R2",
@@ -222,6 +256,79 @@ if missing_perfect_fit_columns:
         f"{perfect_fit_input_path.name}: "
         f"{missing_perfect_fit_columns}"
     )
+
+
+def add_missing_failed_equations(frame, metric_columns, source_name):
+    """Add absent P01-P59 tasks as failed equations."""
+    normalized = frame.copy()
+    normalized["ID"] = normalized["ID"].astype(str).str.strip()
+
+    duplicate_ids = normalized.loc[
+        normalized["ID"].duplicated(),
+        "ID",
+    ].tolist()
+    if duplicate_ids:
+        raise ValueError(
+            f"{source_name}: duplicate task IDs {duplicate_ids}"
+        )
+
+    expected_ids = set(EXPECTED_TASK_IDS)
+    present_ids = set(normalized["ID"])
+    unexpected_ids = sorted(present_ids - expected_ids)
+    if unexpected_ids:
+        raise ValueError(
+            f"{source_name}: unexpected task IDs {unexpected_ids}"
+        )
+
+    missing_ids = [
+        task_id
+        for task_id in EXPECTED_TASK_IDS
+        if task_id not in present_ids
+    ]
+
+    normalized = (
+        normalized
+        .set_index("ID")
+        .reindex(EXPECTED_TASK_IDS)
+    )
+    normalized.index.name = "ID"
+
+    if missing_ids:
+        normalized.loc[missing_ids, metric_columns] = FAILURE_SENTINEL
+        normalized.loc[
+            missing_ids,
+            "structure_similarity_level",
+        ] = "Failed"
+
+    print(
+        f"Added failed equations to {source_name}: "
+        f"{missing_ids or 'none'}"
+    )
+
+    return normalized.reset_index(), missing_ids
+
+
+without_parameter_metric_columns = [
+    column
+    for column in required_columns
+    if column not in {"ID", "structure_similarity_level"}
+]
+with_parameter_metric_columns = [
+    column
+    for column in comparison_columns
+    if column not in {"ID", "structure_similarity_level"}
+]
+
+df, without_parameter_missing_ids = add_missing_failed_equations(
+    df,
+    without_parameter_metric_columns,
+    input_path.name,
+)
+with_parameter_df, with_parameter_missing_ids = add_missing_failed_equations(
+    with_parameter_df,
+    with_parameter_metric_columns,
+    with_parameter_input_path.name,
+)
 
 
 # ============================================================
@@ -329,16 +436,6 @@ noise01 = numeric_column(
 
 
 n_tasks = len(df)
-EXPECTED_TASK_COUNT = 59
-
-without_parameter_failure_count = max(
-    EXPECTED_TASK_COUNT - len(df),
-    0,
-)
-with_parameter_failure_count = max(
-    EXPECTED_TASK_COUNT - len(with_parameter_df),
-    0,
-)
 
 print(
     f"Number of tasks: {n_tasks}"
@@ -621,11 +718,11 @@ with_parameter_level_counts = [
 ]
 
 fig1_level_counts = (
-    [without_parameter_failure_count]
+    [counts.get("Failed", 0)]
     + list(reversed(level_counts))
 )
 fig1_with_parameter_level_counts = (
-    [with_parameter_failure_count]
+    [with_parameter_counts.get("Failed", 0)]
     + list(reversed(with_parameter_level_counts))
 )
 
@@ -636,7 +733,7 @@ fig1_with_parameter_level_counts = (
 # ============================================================
 
 fig, ax = plt.subplots(
-    figsize=(9.2, 4.8)
+    figsize=taller_figsize(9.2, 4.8)
 )
 
 x_levels = np.arange(
@@ -793,7 +890,7 @@ perfect_fit_summary = pd.DataFrame({
 })
 
 print(
-    "Excluded perfect-fit outliers: "
+    "Perfect-fit outliers retained for median/IQR only: "
     f"{perfect_fit_df.loc[perfect_fit_outliers, 'ID'].tolist()}"
 )
 print(
@@ -804,7 +901,7 @@ print(
 
 perfect_fit_r2_stats = [
     median_iqr(
-        clean_perfect_fit_df[column]
+        perfect_fit_df[column]
     )
     for column in perfect_fit_r2_columns
 ]
@@ -865,7 +962,7 @@ xn = np.arange(
 # ============================================================
 
 fig, ax = plt.subplots(
-    figsize=(7.6, 4.8)
+    figsize=taller_figsize(7.6, 4.8)
 )
 
 ax.plot(
@@ -959,7 +1056,7 @@ plt.close(
 # ============================================================
 
 fig, ax = plt.subplots(
-    figsize=(7.6, 4.8)
+    figsize=taller_figsize(7.6, 4.8)
 )
 
 ax.plot(
@@ -1083,13 +1180,13 @@ plt.close(
 
 # ============================================================
 # Combined Figure 3 + Figure 2
-# Top: success rate; bottom: median R² + IQR
+# Left: success rate; right: median R² + IQR
 # ============================================================
 
 fig, axes = plt.subplots(
-    2,
     1,
-    figsize=(8.2, 9.2),
+    2,
+    figsize=A4_FIGSIZE,
     sharex=True,
 )
 
@@ -1219,7 +1316,7 @@ ax.set_ylabel(
 )
 
 ax.set_title(
-    "(b) Median R² with interquartile range"
+    "(b) Median R² and IQR"
 )
 
 ax.set_axisbelow(
@@ -1234,9 +1331,10 @@ ax.legend(
     loc="lower left"
 )
 
-fig.tight_layout(
-    h_pad=2.0,
-)
+axes[0].set_xlabel("Relative noise level")
+axes[0].margins(x=0.09)
+format_a4_figure(fig)
+fig.tight_layout(pad=0.7, w_pad=1.6)
 
 combined_noise_figure = (
     out_dir
@@ -1245,8 +1343,10 @@ combined_noise_figure = (
 
 fig.savefig(
     combined_noise_figure,
-    dpi=300,
-    bbox_inches="tight",
+    dpi=A4_DPI,
+    bbox_inches=None,
+    transparent=False,
+    facecolor="white",
 )
 
 plt.close(
@@ -1334,7 +1434,7 @@ thresholds = [
 
 fig, (ax_overview, ax_zoom) = plt.subplots(
     ncols=2,
-    figsize=(10.2, 4.8),
+    figsize=taller_figsize(10.2, 4.8),
     gridspec_kw={
         "width_ratios": [1, 3],
     },
@@ -1421,12 +1521,12 @@ ax_overview.set_title(
 )
 
 ax_zoom.set_ylim(
-    75,
+    65,
     100,
 )
 
 ax_zoom.set_yticks(
-    np.arange(75, 101, 5)
+    np.arange(65, 101, 5)
 )
 
 break_size = 0.008
@@ -1577,7 +1677,7 @@ mask = (
 
 
 fig, ax = plt.subplots(
-    figsize=(7.6, 5.1)
+    figsize=taller_figsize(7.6, 5.1)
 )
 
 x_values = sim[mask]
@@ -1769,7 +1869,7 @@ for j, (_, arr, kind) in enumerate(
 
 
 fig, ax = plt.subplots(
-    figsize=(10.3, 13.0)
+    figsize=taller_figsize(10.3, 13.0)
 )
 
 im = ax.imshow(
@@ -1864,13 +1964,14 @@ mc = (
 )
 
 fig = plt.figure(
-    figsize=(7.6, 9.0),
+    figsize=A4_FIGSIZE,
+    layout="constrained",
 )
 
 outer_grid = fig.add_gridspec(
-    nrows=2,
-    height_ratios=[1, 1],
-    hspace=0.10,
+    nrows=1,
+    ncols=2,
+    wspace=0.08,
 )
 
 r2_grid = outer_grid[0].subgridspec(
@@ -1933,8 +2034,9 @@ ax_r2.tick_params(
 )
 ax_outlier.tick_params(
     axis="x",
-    labelbottom=False,
+    labelbottom=True,
 )
+ax_outlier.set_xlabel("Formula complexity")
 ax_outlier.yaxis.set_major_locator(
     MaxNLocator(2)
 )
@@ -1965,7 +2067,7 @@ ax_outlier.plot(
 )
 
 ax_r2.set_title(
-    r"(A) Formula complexity versus shared-fit $R^2$"
+    r"(A) Shared-fit $R^2$"
 )
 
 ax_r2.set_ylabel(
@@ -2003,7 +2105,7 @@ ax.set_ylabel(
 )
 
 ax.set_title(
-    "(B) Formula complexity versus structural similarity"
+    "(B) Structural similarity"
 )
 
 ax.set_axisbelow(
@@ -2015,8 +2117,8 @@ ax.grid(
 )
 
 ax.legend()
-
-ax.legend()
+format_a4_figure(fig)
+fig.get_layout_engine().set(w_pad=0.04, h_pad=0.04)
 
 f7 = (
     out_dir
@@ -2025,8 +2127,10 @@ f7 = (
 
 fig.savefig(
     f7,
-    dpi=300,
-    bbox_inches="tight",
+    dpi=A4_DPI,
+    bbox_inches=None,
+    transparent=False,
+    facecolor="white",
 )
 
 plt.close(
@@ -2051,10 +2155,11 @@ r2_distribution_labels = [
 
 
 def r2_distribution_counts(values):
-
-    values = valid_r2(values)
+    all_values = np.asarray(values, dtype=float)
+    values = valid_r2(all_values)
 
     return [
+        int(len(all_values) - len(values)),
         int(np.sum(values < 0)),
         int(np.sum((values >= 0) & (values < 0.9))),
         int(np.sum((values >= 0.9) & (values < 0.99))),
@@ -2067,16 +2172,8 @@ def r2_distribution_counts(values):
 without_parameter_r2_counts = r2_distribution_counts(
     shared_r2
 )
-without_parameter_r2_counts.insert(
-    0,
-    without_parameter_failure_count,
-)
 with_parameter_r2_counts = r2_distribution_counts(
     with_parameter_shared_r2
-)
-with_parameter_r2_counts.insert(
-    0,
-    with_parameter_failure_count,
 )
 
 x_r2 = np.arange(
@@ -2084,7 +2181,7 @@ x_r2 = np.arange(
 )
 
 fig, ax = plt.subplots(
-    figsize=(10.2, 4.8)
+    figsize=taller_figsize(10.2, 4.8)
 )
 
 without_parameter_bars = ax.bar(
@@ -2179,30 +2276,41 @@ plt.close(
 # ============================================================
 
 fig, axes = plt.subplots(
-    nrows=2,
-    figsize=(10.2, 9.6),
+    nrows=1,
+    ncols=2,
+    figsize=A4_LANDSCAPE_FIGSIZE,
 )
+
+combined_r2_labels = [
+    "Failed", "$R^2 < 0$", "$0 \\leq R^2 < 0.9$",
+    "$0.9 \\leq R^2 < 0.99$", "$0.99 \\leq R^2 < 0.9999$",
+    "$0.9999 \\leq R^2 < 1$", "$R^2 = 1$",
+]
+combined_structure_labels = [
+    "Failed", "Dissimilar\n$S<40$", "Rel. low\n$40$–$60$",
+    "Moderate\n$60$–$80$", "Rel. high\n$80$–$95$", "High\n$95$–$100$",
+]
 
 combined_plots = [
     (
         axes[0],
         x_r2,
-        r2_distribution_labels,
+        combined_r2_labels,
         without_parameter_r2_counts,
         with_parameter_r2_counts,
-        r"$R^2$ range",
-        r"(A) Distribution of $R^2$ values",
-        0,
+        r"Shared-fit $R^2$ interval",
+        r"(A) Shared-fit $R^2$ distribution",
+        25,
     ),
     (
         axes[1],
         x_levels,
-        level_labels_with_criteria,
+        combined_structure_labels,
         fig1_level_counts,
         fig1_with_parameter_level_counts,
-        "Structural similarity level",
-        "(B) Distribution of structural similarity levels",
-        10,
+        "Structural similarity level and score interval",
+        "(B) Structural similarity distribution",
+        0,
     ),
 ]
 
@@ -2233,6 +2341,10 @@ for (
         tick_labels,
         rotation=tick_rotation,
     )
+    if tick_rotation:
+        for label in ax.get_xticklabels():
+            label.set_horizontalalignment("right")
+            label.set_rotation_mode("anchor")
     ax.set_xlabel(x_label)
     ax.set_ylabel("Number of tasks")
     ax.set_title(title)
@@ -2250,12 +2362,24 @@ for (
         with_counts,
         fontsize=10,
     )
+    for text in ax.texts:
+        count = int(text.get_text())
+        if count < 4:
+            text.set_y(count + 0.25)
+            text.set_verticalalignment("bottom")
+            text.set_color("black")
     all_counts = without_counts + with_counts
     if all_counts:
         ax.set_ylim(0, max(all_counts) * 1.05)
     ax.legend()
 
-fig.tight_layout()
+format_a4_figure(fig)
+axes[0].tick_params(axis="x", labelsize=6.5)
+axes[1].tick_params(axis="x", labelsize=7)
+for ax in axes:
+    for label in ax.get_xticklabels():
+        label.set_linespacing(0.9)
+fig.tight_layout(pad=0.7, w_pad=1.6)
 
 combined_path = (
     out_dir
@@ -2264,8 +2388,10 @@ combined_path = (
 
 fig.savefig(
     combined_path,
-    dpi=300,
-    bbox_inches="tight",
+    dpi=A4_DPI,
+    bbox_inches=None,
+    transparent=False,
+    facecolor="white",
 )
 
 plt.close(
@@ -2381,7 +2507,7 @@ def plot_wass_r2_dotplot(
 fig, axes = plt.subplots(
     1,
     2,
-    figsize=(11.4, 5.2),
+    figsize=taller_figsize(11.4, 5.2),
     sharey=True,
     layout="constrained",
 )
@@ -2483,7 +2609,7 @@ plt.close(
 fig, axes = plt.subplots(
     2,
     3,
-    figsize=(16, 9),
+    figsize=taller_figsize(16, 9),
 )
 
 
@@ -2494,22 +2620,22 @@ fig, axes = plt.subplots(
 ax = axes[0, 0]
 
 bars = ax.bar(
-    level_order_en,
-    level_counts,
+    ["Failed", *reversed(level_order_en)],
+    fig1_level_counts,
 )
 
 add_bar_labels_inside(
     ax,
     bars,
-    level_counts,
+    fig1_level_counts,
     fontsize=9,
 )
 
-if level_counts:
+if fig1_level_counts:
 
     ax.set_ylim(
         0,
-        max(level_counts) * 1.05,
+        max(fig1_level_counts) * 1.05,
     )
 
 ax.set_title(
@@ -2905,8 +3031,8 @@ print(
 print(
     "Median structural similarity:",
     float(
-        np.nanmedian(
-            sim
+        np.median(
+            sim[np.isfinite(sim)]
         )
     ),
 )
