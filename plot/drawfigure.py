@@ -2,7 +2,6 @@ import argparse
 import math
 import os
 import tempfile
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -358,19 +357,6 @@ ids = (
     .to_numpy()
 )
 
-levels = (
-    df["structure_similarity_level"]
-    .astype(str)
-    .to_numpy()
-)
-
-with_parameter_levels = (
-    with_parameter_df["structure_similarity_level"]
-    .astype(str)
-    .to_numpy()
-)
-
-
 def numeric_column(name):
 
     return pd.to_numeric(
@@ -680,68 +666,34 @@ def set_r2_transformed_axis(ax):
 # Structural similarity categories
 # ============================================================
 
-level_map = {
-    "高度相似": "High",
-    "较高相似": "Relatively high",
-    "中等相似": "Moderate",
-    "较低相似": "Relatively low",
-    "不相似": "Dissimilar",
-}
-
-level_order_cn = [
-    "高度相似",
-    "较高相似",
-    "中等相似",
-    "较低相似",
-    "不相似",
-]
-
 level_order_en = [
-    level_map[x]
-    for x in level_order_cn
+    "High",
+    "Relatively High",
+    "Medium",
+    "Low",
 ]
 
 level_labels_with_criteria = [
-    "Failed\n($R^2 = -\\infty$)",
-    "Dissimilar\n($S < 40$)",
-    "Relatively low\n($40 \\leq S < 60$)",
-    "Moderate\n($60 \\leq S < 80$)",
-    "Relatively high\n($80 \\leq S < 95$)",
-    "High\n($95 \\leq S \\leq 100$)",
+    "Failed\n($S < 0$)",
+    "Low\n($0$–$44$)",
+    "Medium\n($45$–$74$)",
+    "Relatively High\n($75$–$89$)",
+    "High\n($90$–$100$)",
 ]
 
-counts = Counter(
-    levels
-)
+def structure_distribution_counts(scores):
+    valid = scores[np.isfinite(scores) & (scores >= 0)]
+    if np.any(valid > 100):
+        raise ValueError("Structural similarity score exceeds 100.")
+    counts = np.histogram(valid, bins=[0, 45, 75, 90, 100.0000001])[0]
+    return [len(scores) - len(valid), *counts.tolist()]
 
-level_counts = [
-    counts.get(
-        x,
-        0,
-    )
-    for x in level_order_cn
-]
 
-with_parameter_counts = Counter(
-    with_parameter_levels
+fig1_level_counts = structure_distribution_counts(sim)
+fig1_with_parameter_level_counts = structure_distribution_counts(
+    with_parameter_sim
 )
-
-with_parameter_level_counts = [
-    with_parameter_counts.get(
-        level,
-        0,
-    )
-    for level in level_order_cn
-]
-
-fig1_level_counts = (
-    [counts.get("Failed", 0)]
-    + list(reversed(level_counts))
-)
-fig1_with_parameter_level_counts = (
-    [with_parameter_counts.get("Failed", 0)]
-    + list(reversed(with_parameter_level_counts))
-)
+level_counts = list(reversed(fig1_level_counts[1:]))
 
 
 # ============================================================
@@ -2304,8 +2256,8 @@ combined_r2_labels = [
     "$0.9999 \\leq R^2 < 1$", "$R^2 = 1$",
 ]
 combined_structure_labels = [
-    "Failed", "Dissimilar\n$S<40$", "Rel. low\n$40$–$60$",
-    "Moderate\n$60$–$80$", "Rel. high\n$80$–$95$", "High\n$95$–$100$",
+    "Failed\n$S < 0$", "Low\n$0$–$44$", "Medium\n$45$–$74$",
+    "Relatively High\n$75$–$89$", "High\n$90$–$100$",
 ]
 
 combined_plots = [

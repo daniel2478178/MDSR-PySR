@@ -41,8 +41,8 @@ R2_LABELS = [
     "$0.9999 \\leq R^2 < 1$", r"$R^2 = 1$",
 ]
 STRUCTURE_LABELS = [
-    "Failed", "Dissimilar\n$S<40$", "Rel. low\n$40$–$60$",
-    "Moderate\n$60$–$80$", "Rel. high\n$80$–$95$", "High\n$95$–$100$",
+    "Failed\n$S < 0$", "Low\n$0$–$44$", "Medium\n$45$–$74$",
+    "Relatively High\n$75$–$89$", "High\n$90$–$100$",
 ]
 
 
@@ -98,7 +98,12 @@ def r2_counts(values):
 
 
 def structure_counts(values):
-    return distribution_counts(values, [0, 40, 60, 80, 95, 100])
+    values = pd.to_numeric(pd.Series(values), errors="coerce")
+    valid = values[np.isfinite(values) & (values >= 0)]
+    if (valid > 100).any():
+        raise ValueError("Structural similarity score exceeds 100.")
+    counts = np.histogram(valid, bins=[0, 45, 75, 90, 100.0000001])[0]
+    return np.r_[len(values) - len(valid), counts]
 
 
 def style_axis(ax):
