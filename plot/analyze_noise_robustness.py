@@ -30,6 +30,15 @@ def build_parser():
         default=BASE_DIR / "噪声003统计表.xlsx",
     )
     parser.add_argument(
+        "--perfect-fit",
+        type=Path,
+        default=(
+            BASE_DIR.parent
+            / "equation_verfication"
+            / "physicsMDSR_Range_GenerationFormula_noise_metrics.xlsx"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=BASE_DIR / "noise_robustness_figures",
@@ -79,7 +88,10 @@ COLORS = {
     0.01: "#E69F00",
     0.03: "#C44E52",
 }
+PERFECT_COLOR = "#7A5195"
+PERFECT_LABEL = "Perfect equations (clean)"
 FAILURE_SENTINEL = -1e50
+N_TASKS = 59
 
 
 plt.rcParams.update(
@@ -114,6 +126,9 @@ def save_figure(fig, filename):
 
 
 data = {noise: load_workbook(path) for noise, path in TRAINING_FILES.items()}
+perfect_fit = load_workbook(args.perfect_fit.resolve())
+perfect_outliers = perfect_fit[list(TEST_COLUMNS.values())].lt(0).all(axis=1)
+clean_perfect_fit = perfect_fit.loc[~perfect_outliers]
 common_ids = sorted(
     set.intersection(*(set(frame.index) for frame in data.values())),
     key=lambda value: int(value[1:]),
@@ -140,14 +155,14 @@ for (train_noise, test_noise), group in long.groupby(
 ):
     values = group["r2"]
     valid = values.dropna()
-    total = len(values)
+    common_id_count = len(values)
     high_accuracy_count = values.ge(0.9).sum()
     positive_r2_count = values.gt(0).sum()
     summary_rows.append(
         {
             "train_noise": train_noise,
             "test_noise": test_noise,
-            "common_id_count": total,
+            "common_id_count": common_id_count,
             "valid_count": len(valid),
             "invalid_count": values.isna().sum(),
             "median_r2": valid.median(),
@@ -155,14 +170,31 @@ for (train_noise, test_noise), group in long.groupby(
             "q25_r2": valid.quantile(0.25),
             "q75_r2": valid.quantile(0.75),
             "high_accuracy_count": high_accuracy_count,
-            "high_accuracy_rate": high_accuracy_count / total,
+            "high_accuracy_rate": high_accuracy_count / N_TASKS,
             "positive_r2_count": positive_r2_count,
-            "positive_r2_rate": positive_r2_count / total,
+            "positive_r2_rate": positive_r2_count / N_TASKS,
         }
     )
 
 summary = pd.DataFrame(summary_rows)
 summary.to_csv(OUT_DIR / "robustness_summary.csv", index=False)
+
+perfect_summary_rows = []
+for test_noise, column in TEST_COLUMNS.items():
+    values = clean_perfect_fit[column]
+    valid = values.dropna()
+    perfect_summary_rows.append(
+        {
+            "test_noise": test_noise,
+            "median_r2": valid.median(),
+            "q10_r2": valid.quantile(0.10),
+            "q25_r2": valid.quantile(0.25),
+            "q75_r2": valid.quantile(0.75),
+            "high_accuracy_rate": values.ge(0.9).mean(),
+            "positive_r2_rate": values.gt(0).mean(),
+        }
+    )
+perfect_summary = pd.DataFrame(perfect_summary_rows)
 
 paired_rows = []
 for train_noise in (0.01, 0.03):
@@ -193,7 +225,7 @@ paired_summary.to_csv(OUT_DIR / "paired_delta_summary.csv", index=False)
 
 
 # 1. Robustness profile and threshold-based reliability.
-fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.2))
+fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.8))
 axes = axes.ravel()
 for train_noise in TRAINING_FILES:
     selected = summary[summary["train_noise"] == train_noise]
@@ -214,60 +246,62 @@ for train_noise in TRAINING_FILES:
         color=color,
         alpha=0.14,
     )
-    axes[1].plot(
-        x,
-        selected["q10_r2"],
-        color=color,
+
+perfect_x = perfect_summary["test_noise"].to_numpy()
+axes[0].plot(
+    perfect_x,
+    perfect_summary["median_r2"],
+    color=PERFECT_COLOR,
+    marker="s",
+    markerfacecolor="white",
+    markeredgewidth=1.8,
+    linestyle="--",
+    linewidth=2.4,
+    label=PERFECT_LABEL,
+)
+axes[0].set_title("(A) Typical performance")
+axes[0].set_ylabel("R² (median; band = IQR)")
+axes[0].set_ylim(0.82, 1.01)
+axes[0].set_xlabel("Testing noise")
+axes[0].set_xticks(list(TEST_COLUMNS))
+axes[0].set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
+axes[0].grid(axis="y", linestyle=":", alpha=0.35)
+
+column, title, ylabel = (
+    "high_accuracy_rate",
+    "High-accuracy reliability",
+    "Fraction with R² ≥ 0.9",
+)
+axis = axes[1]
+for train_noise in TRAINING_FILES:
+    selected = summary[summary["train_noise"] == train_noise]
+    rates = selected[column].to_numpy()
+    axis.plot(
+        selected["test_noise"],
+        rates,
+        color=COLORS[train_noise],
         marker="o",
         linewidth=2,
         label=LABELS[train_noise],
     )
-
-axes[0].set_title("(A) Typical performance")
-axes[0].set_ylabel("R² (median; band = IQR)")
-axes[0].set_ylim(0.82, 1.01)
-axes[1].set_title("(B) Lower-tail performance")
-axes[1].set_ylabel("10th percentile R²")
-axes[1].set_ylim(0.45, 1.01)
-for axis in axes[:2]:
-    axis.set_xlabel("Testing noise")
-    axis.set_xticks(list(TEST_COLUMNS))
-    axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
-    axis.grid(axis="y", linestyle=":", alpha=0.35)
-
-rate_specs = [
-    (
-        "high_accuracy_rate",
-        "High-accuracy reliability",
-        "Fraction with R² ≥ 0.9",
-    ),
-    (
-        "positive_r2_rate",
-        "Failure-free reliability",
-        "Fraction with R² > 0",
-    ),
-]
-for panel, axis, (column, title, ylabel) in zip(
-    ("C", "D"), axes[2:], rate_specs
-):
-    for train_noise in TRAINING_FILES:
-        selected = summary[summary["train_noise"] == train_noise]
-        rates = selected[column].to_numpy()
-        axis.plot(
-            selected["test_noise"],
-            rates,
-            color=COLORS[train_noise],
-            marker="o",
-            linewidth=2,
-            label=LABELS[train_noise],
-        )
-    axis.set_title(f"({panel}) {title}")
-    axis.set_ylabel(ylabel)
-    axis.set_xlabel("Testing noise")
-    axis.set_xticks(list(TEST_COLUMNS))
-    axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
-    axis.set_ylim((0.55, 1.02) if column == "high_accuracy_rate" else (0.84, 1.02))
-    axis.grid(axis="y", linestyle=":", alpha=0.35)
+axis.plot(
+    perfect_x,
+    perfect_summary[column],
+    color=PERFECT_COLOR,
+    marker="s",
+    markerfacecolor="white",
+    markeredgewidth=1.8,
+    linestyle="--",
+    linewidth=2.4,
+    label=PERFECT_LABEL,
+)
+axis.set_title(f"(B) {title}")
+axis.set_ylabel(ylabel)
+axis.set_xlabel("Testing noise")
+axis.set_xticks(list(TEST_COLUMNS))
+axis.set_xticklabels(["0", "0.01", "0.03", "0.05", "0.10"])
+axis.set_ylim(0.55, 1.02)
+axis.grid(axis="y", linestyle=":", alpha=0.35)
 
 color_handles, color_labels = axes[0].get_legend_handles_labels()
 
@@ -292,19 +326,7 @@ axes[0].legend(
 )
 axes[1].legend(
     handles=[line_handle],
-    labels=["Line/markers: 10th-percentile R²"],
-    loc="lower left",
-    fontsize=8,
-)
-axes[2].legend(
-    handles=[line_handle],
     labels=["Line/markers: fraction with R² ≥ 0.9"],
-    loc="lower left",
-    fontsize=8,
-)
-axes[3].legend(
-    handles=[line_handle],
-    labels=["Line/markers: fraction with R² > 0"],
     loc="lower left",
     fontsize=8,
 )
@@ -317,11 +339,11 @@ fig.legend(
     color_handles,
     color_labels,
     loc="upper center",
-    bbox_to_anchor=(0.5, 0.95),
-    ncol=3,
+    bbox_to_anchor=(0.5, 0.93),
+    ncol=4,
     frameon=False,
 )
-fig.tight_layout(rect=[0, 0.02, 1, 0.93], h_pad=2.2)
+fig.tight_layout(rect=[0, 0.02, 1, 0.88])
 save_figure(fig, "01_r2_robustness_profile.png")
 
 legacy_rate_figure = OUT_DIR / "02_reliability_rates.png"

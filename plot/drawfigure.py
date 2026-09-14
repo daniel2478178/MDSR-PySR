@@ -47,6 +47,13 @@ def taller_figsize(width, height):
 A4_FIGSIZE = taller_figsize(190 / 25.4, 78 / 25.4)
 A4_LANDSCAPE_FIGSIZE = taller_figsize(267 / 25.4, 78 / 25.4)
 A4_DPI = 800
+STRUCTURE_LEVEL_ALIASES = {
+    "High": "高度相似",
+    "Relatively High": "较高相似",
+    "Medium": "中等相似",
+    "Low": "较低相似",
+    "Dissimilar": "不相似",
+}
 
 
 def format_a4_figure(fig):
@@ -129,15 +136,25 @@ print("=" * 80)
 
 df = pd.read_excel(
     input_path,
-    sheet_name="Sheet1",
+    sheet_name=0,
     engine="openpyxl",
 )
+if "structure_similarity_level" not in df.columns:
+    df = df.rename(
+        columns={"structure_similarity_leve": "structure_similarity_level"}
+    )
 
 with_parameter_df = pd.read_excel(
     with_parameter_input_path,
     sheet_name="Sheet1",
     engine="openpyxl",
 )
+
+for frame in (df, with_parameter_df):
+    if "structure_similarity_level" in frame.columns:
+        frame["structure_similarity_level"] = frame[
+            "structure_similarity_level"
+        ].replace(STRUCTURE_LEVEL_ALIASES)
 
 perfect_fit_df = pd.read_excel(
     perfect_fit_input_path,
